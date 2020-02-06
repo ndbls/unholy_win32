@@ -14,7 +14,7 @@ The superstar of this library is the **much** more powerful collection of featur
 
 # Bridges are the key feature 🔑
 What are bridges?
-  - A bridge is a function that, when called, can seamlessly call a function in a remote process and wrap that function's return value to the local process as if the bridge itself were somehow the remote function, but accessible locally. Callers of bridge functions call the bridge function like it would a regular function in its local address space, and the caller does not have be aware it is calling a bridge function.
+  - A bridge is a function that, when called, can seamlessly call a function in a remote process and wrap that function's return value to the local process as if the bridge itself were somehow the remote function, but accessible locally. Callers of bridge functions call the bridge function like they would a regular function in their local address space, and the caller does not have be aware it is calling a bridge function.
   - Bridges can also be created in remote processes as a bridge to a local function, allowing for callback functions in remote processes which when called by that process, can call local functions without the remote process having the knowledge that it is interacting with a bridge.
 
 This is extremely useful for programs that would otherwise inject code into another process in order to modify its behaviour. It is an extremely lightweight alternative to any method of code injection, and it is also much less detectable as the bridges only keep (a *very* small amount of) memory allocated in the remote process during the period of time they are running that gets cleaned up once the bridge returns.
@@ -53,6 +53,7 @@ This is the unholy program that will be modifying the target program while it is
 // main.c - hacker.exe (program that modifies the target program's behaviour)
 #include <stdio.h>
 #include <Windows.h>
+#include "unholy/win32memory.hpp"
 #include "unholy/win32bridges.hpp"
 
 #define MOD_NAME "target.exe"
