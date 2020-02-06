@@ -1,15 +1,18 @@
-
 # ⛧ Unholy Win32  ⛧
 
 Unholy is a C++17 library enabling some powerful hacks within x86 Windows systems.
 
-It is essentially a standard memory hacking library, except it features a unique set of tools which allow for function calls across process boundaries, nicknamed *bridges*.
+It is essentially a standard memory hacking library, except it features a unique set of tools which allow for seamless function calls with wrapped return values across process boundaries, nicknamed *bridges*.
 
-With this library (specifically the *bridge* tools), you are able to seamlessly call a function in another process and receive its return value, without having to be inside its address space. It can be difficult to understand the purpose and power of this library from these explanations without an example, so here's a very easy to digest, simplified use case of this unholy library:
+It can be difficult to understand the purpose and power of this library from just explanations without an example, so here's a very easy to digest, simplified use case of this unholy library:
 
->You have program `banking_application.exe` and program `hacker.exe`. The latter program contains the unholy library, and it uses unholy bridges to call the function `int transferMoney(int accountId, int amount)` which is internal to `banking_application.exe`. No traditional methods of code injection required.
+>You have program `banking_application.exe` and program `hacker.exe`. The latter program contains the unholy library, and it uses unholy bridges to call the function `int transferMoney(int accountId, int amount)` which is internal to `banking_application.exe`.
 
-Of course that is a dramatic example, but this library is flexible and the applications could be anything, such as `game.exe` and `cheat.exe` calling `void setHealth(int value)` completely externally. Bridges can also be in reverse, functioning like a callback from a remote process to a local function.
+Of course that is a dramatic example, but this library is flexible and the applications could be anything, such as `game.exe` and `cheat.exe` calling `void setHealth(int value)` completely externally. Bridges can also be in reverse, functioning like a callback from a remote process to a local function:
+
+>You have a program `enigma.exe` that you did not create, and a program `security_researcher.exe` you have created. You would like to reverse engineer what `enigma.exe` does. You use unholy reverse bridges to create functions inside `engima.exe` while it is running that call back to logging functions you created inside `security_researcher.exe`. You use unholy hooks to hook winapi functions to point to your reverse bridges and build a log of intercepted winapi calls that allow you to better understand the functioning of `enigma.exe`.
+
+No traditional methods of code injection are required in these examples, all of this can be done without having to leave your local program. No need to create a DLL or use an injector.
 
 Unholy Win32 also has everything one would expect from a regular memory hacking library,
   - Hooking of local and remote functions
