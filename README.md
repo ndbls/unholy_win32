@@ -12,7 +12,7 @@ However...
 These memory manipulation tools, while useful, are not the star of unholy win32.
 The superstar of this library is the **much** more powerful collection of features in the bridge toolset.
 
-# Bridges are the key feature
+# Bridges are the key feature 🔑
 What are bridges?
   - A bridge is a function that, when called, can seamlessly call a function in a remote process and wrap that function's return value to the local process as if the bridge itself were somehow the remote function, but accessible locally. Callers of bridge functions call the bridge function like it would a regular function in its local address space, and the caller does not have be aware it is calling a bridge function.
   - Bridges can also be created in remote processes as a bridge to a local function, allowing for callback functions in remote processes which when called by that process, can call local functions without the remote process having the knowledge that it is interacting with a bridge.
@@ -22,7 +22,7 @@ This is extremely useful for programs that would otherwise inject code into anot
 ## How do I use this?
 Just include the files in your C++ project. If you include bridges, make sure you are compiling with c++17 and with the options specified at the top of `win32bridges.hpp`. This library can only be compiled with x86 MSVC due to the nature of how targeted it is, specifically bridges.
 
-I recommend you check out the [example projects](https://github.com/abls/unholy_examples) to better understand how to use bridges and the memory tools. The examples are very organized and straightforward, with comments, so it shouldn't be too difficult to understand. All of the functions are well documented with comments as well.
+You should check out the [example projects](https://github.com/abls/unholy_examples) to better understand how to use bridges and the memory tools. The examples are very organized and straightforward, with comments, so it shouldn't be too difficult to understand. All of the functions are well documented with comments as well.
 
 Here's a simple example of bridges just to give you a taste before you check out the example projects...
 
@@ -63,7 +63,7 @@ This is the unholy program that will be modifying the target program while it is
 typedef int(__cdecl* hello_t)(char* name);
 
 int main() {
-   // Get necessary info about the process...
+    // Get necessary info about the process...
     uint32_t rmt_pid = MemRmt::getPid(MOD_NAME);
     HANDLE rmt_handle = OpenProcess(PROCESS_ALL_ACCESS, 0, rmt_pid);
     uint32_t img_base_addr = MemRmt::getModBase(rmt_pid, MOD_NAME);
@@ -93,7 +93,7 @@ int main() {
 }
 ```
 
-If anything is unclear, take a peek at the source code. There is some really useful information in the comments underneath organized ascii art headers that should clear up any questions you have.
+If anything is unclear, take a peek at the source code or look at the [examples](https://github.com/abls/unholy_examples). There is some really useful information in the comments underneath organized ascii art headers that should clear up any questions you have.
 
 ### Todos
  - Benchmarks
