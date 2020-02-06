@@ -67,12 +67,12 @@ typedef struct BridgeData {
 //  |     PROBE FUNCTIONS     |
 //  ---------------------------
 //
-// Probe functions are helpers functions used by bridge functions to
+// Probe functions are helper functions used by bridge functions to
 // call the target function. Probe functions are copied into the
-// remote process and run in remote address space and do the actual
+// remote process and run in remote address space to do the actual
 // calling of the target function. Probes are meant to be called with
-// CreateRemoteThread with the argument passed as a pointer to a
-// ProbeParameters struct.
+// CreateRemoteThread with a pointer to a ProbeParameters struct
+// passed as the thread argument.
 
 // You will see a lot of repeat asm code throughout these functions.
 // I can't break them into smaller functions, since they need to be
@@ -646,7 +646,7 @@ __declspec(naked) DWORD WINAPI probeFastcallRtnDbl_ptbl(LPVOID) {
 // You will see a lot of repeat code throughout these functions.
 // I can't break them into smaller functions, since they need to be
 // portable so that I can just copy one function over to a remote
-// process. I didn't want to make one big probe function with checks
+// process. I didn't want to make one big bridge function with checks
 // for different scenarios because I want remote function calls to be
 // as fast as possible.
 #pragma region Bridge Functions
@@ -684,7 +684,7 @@ __declspec(naked) void* __cdecl bridgeCdecl_ptbl() {
 	// Copy the arg info to the probe parameters, and adjust the nslots if a handle is to be passed
 	local_probe_params->arg_info = bridge_data->arg_info;
 	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+		local_probe_params->arg_info += bridge_data->pass_handle;
 
 	// Calculate size of memory chunk needed to store args
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
@@ -787,7 +787,7 @@ __declspec(naked) void* __stdcall bridgeCdeclRtn64_ptbl() {
 
 	local_probe_params->arg_info = bridge_data->arg_info;
 	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+		local_probe_params->arg_info += bridge_data->pass_handle;
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -879,7 +879,7 @@ __declspec(naked) void* __stdcall bridgeCdeclRtnFlt_ptbl() {
 
 	local_probe_params->arg_info = bridge_data->arg_info;
 	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+		local_probe_params->arg_info += bridge_data->pass_handle;
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -969,7 +969,7 @@ __declspec(naked) void* __stdcall bridgeCdeclRtnDbl_ptbl() {
 
 	local_probe_params->arg_info = bridge_data->arg_info;
 	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+		local_probe_params->arg_info += bridge_data->pass_handle;
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -1058,7 +1058,7 @@ __declspec(naked) void* __stdcall bridgeStdcall_ptbl() {
 
 	local_probe_params->arg_info = bridge_data->arg_info;
 	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+		local_probe_params->arg_info += bridge_data->pass_handle;
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -1165,7 +1165,7 @@ __declspec(naked) void* __stdcall bridgeStdcallRtn64_ptbl() {
 
 	local_probe_params->arg_info = bridge_data->arg_info;
 	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+		local_probe_params->arg_info += bridge_data->pass_handle;
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -1273,7 +1273,7 @@ __declspec(naked) void* __stdcall bridgeStdcallRtnFlt_ptbl() {
 
 	local_probe_params->arg_info = bridge_data->arg_info;
 	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+		local_probe_params->arg_info += bridge_data->pass_handle;
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -1378,7 +1378,7 @@ __declspec(naked) void* __stdcall bridgeStdcallRtnDbl_ptbl() {
 
 	local_probe_params->arg_info = bridge_data->arg_info;
 	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+		local_probe_params->arg_info += bridge_data->pass_handle;
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -1487,8 +1487,15 @@ __declspec(naked) void* __fastcall bridgeFastcall_ptbl() {
 	local_probe_params->target_func = bridge_data->target_func;
 
 	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+	if (bridge_data->pass_handle) {
+		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
+			local_probe_params->arg_info += 1; // nslots + 1
+
+		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {
+			// set idx2 to current idx1, then set idx1 to 0x00
+			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) | ((local_probe_params->arg_info << 8) & 0x00ff0000);
+		}
+	}
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -1579,6 +1586,8 @@ __declspec(naked) void* __fastcall bridgeFastcall_ptbl() {
 		and ecx, 0xff // get nslots from arg info for later clearing
 		sub ecx, [arg_reg_count] // adjust to be number of slots that are actually on the stack
 
+		add esp, 8 // because I pushed ecx and edx to save their values
+
 		pop edi
 		pop esi
 		pop ebx
@@ -1629,8 +1638,15 @@ __declspec(naked) void* __fastcall bridgeFastcallRtn64_ptbl() {
 	local_probe_params->target_func = bridge_data->target_func;
 
 	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+	if (bridge_data->pass_handle) {
+		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
+			local_probe_params->arg_info += 1; // nslots + 1
+
+		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {
+			// set idx2 to current idx1, then set idx1 to 0x00
+			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) | ((local_probe_params->arg_info << 8) & 0x00ff0000);
+		}
+	}
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -1723,6 +1739,8 @@ __declspec(naked) void* __fastcall bridgeFastcallRtn64_ptbl() {
 		and ecx, 0xff // get nslots from arg info for later clearing
 		sub ecx, [arg_reg_count] // adjust to be number of slots that are actually on the stack
 
+		add esp, 8
+
 		pop edi
 		pop esi
 		pop ebx
@@ -1773,8 +1791,15 @@ __declspec(naked) void* __fastcall bridgeFastcallRtnFlt_ptbl() {
 	local_probe_params->target_func = bridge_data->target_func;
 
 	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+	if (bridge_data->pass_handle) {
+		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
+			local_probe_params->arg_info += 1; // nslots + 1
+
+		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {
+			// set idx2 to current idx1, then set idx1 to 0x00
+			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) | ((local_probe_params->arg_info << 8) & 0x00ff0000);
+		}
+	}
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -1865,6 +1890,8 @@ __declspec(naked) void* __fastcall bridgeFastcallRtnFlt_ptbl() {
 		and ecx, 0xff // get nslots from arg info for later clearing
 		sub ecx, [arg_reg_count] // adjust to be number of slots that are actually on the stack
 
+		add esp, 8
+
 		pop edi
 		pop esi
 		pop ebx
@@ -1915,8 +1942,15 @@ __declspec(naked) void* __fastcall bridgeFastcallRtnDbl_ptbl() {
 	local_probe_params->target_func = bridge_data->target_func;
 
 	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params += bridge_data->pass_handle;
+	if (bridge_data->pass_handle) {
+		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
+			local_probe_params->arg_info += 1; // nslots + 1
+
+		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {
+			// set idx2 to current idx1, then set idx1 to 0x00
+			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) | ((local_probe_params->arg_info << 8) & 0x00ff0000);
+		}
+	}
 
 	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
 
@@ -2006,6 +2040,8 @@ __declspec(naked) void* __fastcall bridgeFastcallRtnDbl_ptbl() {
 		mov ecx, [ecx]BridgeData.arg_info
 		and ecx, 0xff // get nslots from arg info for later clearing
 		sub ecx, [arg_reg_count] // adjust to be number of slots that are actually on the stack
+
+		add esp, 8
 
 		pop edi
 		pop esi
@@ -2155,7 +2191,7 @@ void* Bridges::_createBridge(HANDLE rmt_handle, void* target_func, int func_type
 		local_probe_func_size = Memory::Local::calcFuncSize(local_probe_func);
 
 	// BridgeData struct to be patched into the copied bridge function
-	BridgeData* local_bridge_data = new BridgeData {
+	BridgeData* local_bridge_data = new BridgeData{
 		new_local_handle,
 		new_rmt_handle,
 
@@ -2213,6 +2249,6 @@ void* Bridges::_createBridge(HANDLE rmt_handle, void* target_func, int func_type
 }
 
 // TODO: improve how users specify return type
-// TODO: run some benchmarking comparing bridges to locally calling functions... I'm curious if there is a significant cost.
+// TODO: run some benchmarking comparing bridges to locally calling functions... I'm curious if there is a significant speed difference
 // TODO: make a function that lets you call remote functions without building a bridge, just like a small little callRmt() or something
-// TODO: make a way to destroy bridges that cleans up everything in both processes (dont forget to close the local_handle passed to remote process in bridgeLocal)
+// TODO: make a way to destroy bridges that cleans up everything in both processes (dont forget to close the handles!)
