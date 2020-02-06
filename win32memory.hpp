@@ -55,6 +55,7 @@ namespace Memory {
 		}
 
 		// Finds the end of a function.
+		// Works by scanning for prolog of next function.
 		void* findFuncEnd(void* func);
 
 		// Determines the size of a function in bytes.
@@ -64,9 +65,11 @@ namespace Memory {
 		}
 
 		// Duplicate a function.
+		// Does not patch calls/jmps/etc.
 		void* duplicateFunc(void* func);
 
 		// Duplicate a function.
+		// Does not patch calls/jmps/etc.
 		template <typename T>
 		inline T duplicateFunc(void* func) {
 			return reinterpret_cast<T>(duplicateFunc(func));

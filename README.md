@@ -1,9 +1,17 @@
+
 # ⛧ Unholy Win32  ⛧
 
 Unholy is a C++17 library enabling some powerful hacks within x86 Windows systems.
+
 It is essentially a standard memory hacking library, except it features a unique set of tools which allow for function calls across process boundaries, nicknamed *bridges*.
 
-It has everything one would expect from a memory hacking library,
+With this library (specifically the *bridge* tools), you are able to seamlessly call a function in another process and receive its return value, without having to be inside its address space. It can be difficult to understand the purpose and power of this library from these explanations without an example, so here's a very easy to digest, simplified use case of this unholy library:
+
+>You have program `banking_application.exe` and program `hacker.exe`. The latter program contains the unholy library, and it uses unholy bridges to call the function `int transferMoney(int accountId, int amount)` which is internal to `banking_application.exe`. No traditional methods of code injection required.
+
+Of course that is a dramatic example, but this library is flexible and the applications could be anything, such as `game.exe` and `cheat.exe` calling `void setHealth(int value)` completely externally. Bridges can also be in reverse, functioning like a callback from a remote process to a local function.
+
+Unholy Win32 also has everything one would expect from a regular memory hacking library,
   - Hooking of local and remote functions
   - Scanning of local and remote process memory space
   - Utilities for easy manipulation of remote process memory
@@ -13,23 +21,44 @@ These memory manipulation tools, while useful, are not the star of unholy win32.
 The superstar of this library is the **much** more powerful collection of features in the bridge toolset.
 
 # Bridges are the key feature 🔑
-What are bridges?
-  - A bridge is a function that, when called, can seamlessly call a function in a remote process and wrap that function's return value to the local process as if the bridge itself were somehow the remote function, but accessible locally. Callers of bridge functions call the bridge function like they would a regular function in their local address space, and the caller does not have be aware it is calling a bridge function.
-  - Bridges can also be created in remote processes as a bridge to a local function, allowing for callback functions in remote processes which when called by that process, can call local functions without the remote process having the knowledge that it is interacting with a bridge.
+What exactly are bridges?
+  - A bridge function is essentially a function in your program's local process which is bound to a specific function in a remote process you set during the bridge creation, and the bridge will emulate that remote function as if the bridge *is* the remote function magically accessible from the local process. It receives the same arguments the remote function would, and it handles all of the complicated actions that go into making the remote call happen and returning the remote return value. In most cases, the caller of the bridge does not even have to be aware it is interacting with a bridge.
 
-This is extremely useful for programs that would otherwise inject code into another process in order to modify its behaviour. It is an extremely lightweight alternative to any method of code injection, and it is also much less detectable as the bridges only keep (a *very* small amount of) memory allocated in the remote process during the period of time they are running that gets cleaned up once the bridge returns.
+  - **Bridges can also be created in remote processes as a bridge to a local function**, allowing for callback functions in remote processes which when called by that process, can call local functions without the remote process having the knowledge that it is interacting with a bridge. These can be referred to as *reverse bridges*.
+
+This is extremely useful for programs that would otherwise inject code into another process in order to modify its behavior or to hook functions to aid in reverse engineering (since unholy memory tools contains hooking functions).
 
 ## How do I use this?
-Just import the files into your C++ project. If you include bridges, make sure you are compiling with c++17 and with the options specified at the top of `win32bridges.hpp`. This library can only be compiled with x86 MSVC due to the nature of how targeted it is, specifically bridges.
+Just import the files into your C++ project.
+
+If you just want memory scanning/hooking, only copy `win32memory.hpp` and `win32memory.cpp` into your project and the library can still function . If you want to use `win32bridges`, then you must copy all four files into your project, as `win32bridges` cannot operate without the `win32memory` files.  
+
+**If you include bridges, ensure you set `/std:c++17 /RTCu /INCREMENTAL:NO` in your compiler.** See the comment at the top of `win32bridges.hpp` for more details.
+
+This library can only be compiled with x86 MSVC due to the nature of how targeted it is, specifically bridges.
+It might compile with other tools if given a little bit of work, but it has not been tested.
 
 You should check out the [example projects](https://github.com/abls/unholy_examples) to better understand how to use bridges and the memory tools. The examples are very organized and straightforward, with comments, so it shouldn't be too difficult to understand. All of the functions are well documented with comments as well.
 
-Here's a simple example of bridges just to give you a taste before you check out the example projects...
+## FAQs
+> So like... What does it do?
+
+Unholy Win32 let's you, among other things, easily call functions you aren't supposed to in a process you do not have control of. You can also create remote callbacks to local functions. It lets you do some memory scanning and patching as well, but that's not the main focus of the library.
+
+> Well, what could this be used for?
+
+A whole lot! One legitimate use might be a logging system where you hook remote functions to a reverse bridge that calls back to the local process (think like DLL injection + MS detours). Other uses might be debugging, reverse engineering, malware, or game cheats.
+
+> How are bridges different from DLL injection?
+
+So, it's actually fairly similar but arguably more lightweight. Definitely check out the source code if you want to know more, but at a very high level bridges work a lot like manual mapping. Unlike manual mapping, bridges avoid loading an entire DLL and instead they allocate and write to a *very* tiny region of memory in the remote process that acts as a gateway, or a probe, into the remote process. This region only briefly remains allocated for the duration of the function call as well.
+
+It's also much easier to use bridges than DLL injection, as you don't have to compile and manage a separate DLL and mess with injectors. In just a few lines using unholy win32, you can hook a function in a remote process, intercept the arguments, and do whatever you want with the return value (you can even call the original function), all without having to leave the comfort of your local process.
 
 ## Simple bridge example
 This example is broken up into two programs, since the function of bridges is to enable complex interaction between different processes.
 
-This first program is the target program that will be getting modified by our unholy program.
+This first program is the target program whose run-time behavior will be getting modified by our unholy program.
 ```c++
 // main.c - target.exe (the program getting dynamically modified)
 #include <stdio.h>
@@ -48,7 +77,7 @@ int main() {
 }
 ```
 
-This is the unholy program that will be modifying the target program while it is running.
+This is the unholy program that will be modifying the behavior of the target program while it is running.
 ```c++
 // main.c - hacker.exe (program that modifies the target program's behaviour)
 #include <stdio.h>
@@ -84,6 +113,9 @@ int main() {
         BRIDGE_ARGS(char*)          // This is a special macro that will generate
     );                              // encoded argument info from a list of types.
     
+    // If you are wondering, createBridgeLocal is how you would create a bridge
+    // from a remote process to a local function. Rmt isn't the only option.
+
     // Now we can call the bridge
     int rtn_val = hello(my_name);
 
@@ -94,9 +126,10 @@ int main() {
 }
 ```
 
-If anything is unclear, take a peek at the source code or look at the [examples](https://github.com/abls/unholy_examples). There is some really useful information in the comments underneath organized ascii art headers that should clear up any questions you have.
+If anything is unclear, check out the much more developed [examples](https://github.com/abls/unholy_examples). You should also take a peek at the source code. There is some really useful information in the comments, generally organized underneath some ascii art headers, that should clear up any questions you have.
 
 ### Todos
  - Benchmarks
  - Bridge destruction
  - One-time remote call function that does not build an entire bridge, just calls a function
+ - Flesh out the hooks to have a variety of different hooking methods
