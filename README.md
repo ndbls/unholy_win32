@@ -22,7 +22,7 @@ The superstar of this library is the **much** more powerful collection of featur
 
 # Bridges are the key feature 🔑
 What exactly are bridges?
-  - A bridge function is essentially a function in your program's local process which is bound to a specific function in a remote process you set during the bridge creation, and the bridge will emulate that remote function as if the bridge *is* the remote function magically accessible from the local process. It receives the same arguments the remote function would, and it handles all of the complicated actions that go into making the remote call happen and returning the remote return value. In most cases, the caller of the bridge does not even have to be aware it is interacting with a bridge.
+  - A bridge function is essentially a function in your program's local process which is bound to a specific function in a remote process you set during the bridge creation, and the bridge will emulate that remote function **as if the bridge *is* the remote function magically accessible from the local process**. It receives the same arguments the remote function would, and it handles all of the complicated actions that go into making the remote call happen and returning the remote return value. In most cases, the caller of the bridge does not even have to be aware it is interacting with a bridge.
 
   - **Bridges can also be created in remote processes as a bridge to a local function**, allowing for callback functions in remote processes which when called by that process, can call local functions without the remote process having the knowledge that it is interacting with a bridge. These can be referred to as *reverse bridges*.
 
