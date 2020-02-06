@@ -20,7 +20,7 @@ What are bridges?
 This is extremely useful for programs that would otherwise inject code into another process in order to modify its behaviour. It is an extremely lightweight alternative to any method of code injection, and it is also much less detectable as the bridges only keep (a *very* small amount of) memory allocated in the remote process during the period of time they are running that gets cleaned up once the bridge returns.
 
 ## How do I use this?
-Just include the files in your C++ project. If you include bridges, make sure you are compiling with c++17 and with the options specified at the top of `win32bridges.hpp`. This library can only be compiled with x86 MSVC due to the nature of how targeted it is, specifically bridges.
+Just import the files into your C++ project. If you include bridges, make sure you are compiling with c++17 and with the options specified at the top of `win32bridges.hpp`. This library can only be compiled with x86 MSVC due to the nature of how targeted it is, specifically bridges.
 
 You should check out the [example projects](https://github.com/abls/unholy_examples) to better understand how to use bridges and the memory tools. The examples are very organized and straightforward, with comments, so it shouldn't be too difficult to understand. All of the functions are well documented with comments as well.
 
