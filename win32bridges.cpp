@@ -80,554 +80,270 @@ typedef struct BridgeData {
 // process. I didn't want to make one big probe function with checks
 // for different scenarios because I want remote function calls to be
 // as fast as possible.
+
+// BRICKS
+#pragma region Probe Bricks
+
+// THE BRICKS THAT MAKE UP A PROBE
+//   - Set up stack frame
+//   - Load argdata and arginfo.nslots from ProbeParameters
+//   - Prepare args for the function call
+//   - Call the target function
+//   - Remove args from stack
+//   - Retrieve return value
+//   - Clean up stack frame, return
+
+// Set up stack frame
+#define BRK_PROBE_STACKFRAME_SETUP __asm { \
+	__asm push ebp                         \
+	__asm mov ebp, esp                     \
+    __asm push esi                         \
+    __asm push edi                         \
+	__asm push ebx                         \
+}
+
+// Load argdata and arginfo.nslots from ProbeParameters
+#define BRK_PROBE_LOADPARAMS __asm {                   \
+	__asm mov ebx, [ebp + 8] /* probe_params */        \
+	__asm mov esi, [ebx]ProbeParameters.arg_info       \
+	__asm and esi, 0xff /* get nslots from arg_info */ \
+	__asm mov eax, [ebx]ProbeParameters.argdata        \
+}
+
+// Prepare args for function call
+#define BRK_PROBE_PREPARGS __asm {   \
+	__asm argloop_start:             \
+	__asm dec esi                    \
+	__asm cmp esi, 0                 \
+	__asm jl short argloop_end       \
+	__asm push[eax + esi * TYPE int] \
+	__asm jmp short argloop_start    \
+	__asm argloop_end:               \
+}
+
+// Prepare args for function call
+#define BRK_PROBE_PREPARGS_FASTCALL __asm { \
+	__asm mov edi, [ebx]ProbeParameters.arg_info \
+	__asm shr edi, 16 \
+	__asm and edi, 0xff /* edi will be second slot index */ \
+\
+	__asm mov ebx, [ebx]ProbeParameters.arg_info \
+	__asm shr ebx, 8 \
+	__asm and ebx, 0xff /* ebx will be first slot index */ \
+\
+	__asm argloop_start: \
+	__asm dec esi \
+	__asm cmp esi, 0 \
+	__asm jl short argloop_end \
+\
+	__asm cmp esi, ebx /* test if current arg is marked as first arg that is 4 bytes or less */ \
+	__asm jne short test_second_reg_arg \
+	__asm mov ecx, [eax + esi * TYPE int] /* load first register arg */ \
+	__asm jmp short argloop_start \
+\
+	__asm test_second_reg_arg: /* test if current arg is marked as second arg that is 4 bytes or less */ \
+	__asm cmp esi, edi \
+	__asm jne short load_stack_arg \
+	__asm mov edx, [eax + esi * TYPE int] /* load second register arg */ \
+	__asm jmp short argloop_start \
+ \
+	__asm load_stack_arg: \
+	__asm push[eax + esi * TYPE int] /* push arg onto stack */ \
+	__asm jmp short argloop_start \
+	__asm argloop_end: \
+}
+
+// Call target function
+#define BRK_PROBE_CALLTARGET __asm {   \
+	__asm call [ebx]ProbeParameters.target_func \
+}
+
+// Call target function
+#define BRK_PROBE_CALLTARGET_FASTCALL __asm {   \
+	__asm mov ebx, [ebp + 8] /* probe_params */ \
+	__asm call [ebx]ProbeParameters.target_func \
+}
+
+// Remove args from stack
+#define BRK_PROBE_REMOVEARGS __asm {                   \
+	__asm mov ecx, [ebx]ProbeParameters.arg_info       \
+	__asm and ecx, 0xff /* get nslots from arg_info */ \
+	__asm lea esp, [esp + ecx * TYPE int]              \
+}
+
+// Retrieve return value (int)
+#define BRK_PROBE_GETRTNVAL_INT __asm {             \
+	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr \
+	__asm cmp ecx, 0                                \
+	__asm je short noret                            \
+	__asm mov[ecx], eax                             \
+	__asm noret:                                    \
+}
+
+// Retrieve return value (int64)
+#define BRK_PROBE_GETRTNVAL_INT64 __asm {           \
+	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr \
+	__asm cmp ecx, 0                                \
+	__asm je short noret                            \
+	__asm mov[ecx], eax                             \
+	__asm mov[ecx + 4], edx                         \
+	__asm noret:                                    \
+}
+
+// Retrieve return value (float)
+#define BRK_PROBE_GETRTNVAL_FLOAT __asm {           \
+	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr \
+	__asm cmp ecx, 0                                \
+	__asm je short noret                            \
+	__asm fstp dword ptr[ecx]                       \
+	__asm noret:                                    \
+}
+
+// Retrieve return value (double)
+#define BRK_PROBE_GETRTNVAL_DOUBLE __asm {          \
+	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr \
+	__asm cmp ecx, 0                                \
+	__asm je short noret                            \
+	__asm fstp qword ptr[ecx]                       \
+	__asm noret:                                    \
+}
+
+// Clean up stack frame and return
+#define BRK_PROBE_STACKFRAME_CLEANUP __asm { \
+	__asm pop ebx                            \
+	__asm pop edi                            \
+	__asm pop esi                            \
+	__asm pop ebp                            \
+	__asm ret 4                              \
+}
+
+#pragma endregion
+
+// FUNCTIONS
 #pragma region Probe Functions
 
+// For cdecl that returns 32 bit values (int, pointers, etc) that ARE NOT floating-point values
 __declspec(naked) DWORD WINAPI probeCdecl_ptbl(LPVOID) {
-	__asm {
-		// Set up stack and preserve registers
-		push ebp
-		mov ebp, esp
-		push ebx
-
-		// Load important data from the ProbeParameters struct arg into various registers
-		mov ebx, [ebp + 8] // probe_params
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		// Loop that loads the args onto the stack
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		push [eax + ecx * TYPE int]
-		jmp short argloop_start
-		argloop_end:
-
-		// Call the target function
-		call [ebx]ProbeParameters.target_func
-
-		// Remove args from stack
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		lea esp, [esp + ecx * TYPE int]
-
-		// If an address to store the return value is given,
-		// then write the return value to that address
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		mov [ecx], eax
-		noret:
-
-		// Restore registers, clean up stack, and return
-		pop ebx
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS
+	BRK_PROBE_CALLTARGET
+	BRK_PROBE_REMOVEARGS
+	BRK_PROBE_GETRTNVAL_INT
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For cdecl that returns 64 bit structs (__int64, actual structs, etc) that ARE NOT floating-point values
 __declspec(naked) DWORD WINAPI probeCdeclRtn64_ptbl(LPVOID) {
-	// For cdecl that returns 64 bit structs (__int64, actual structs, etc) that ARE NOT floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		push [eax + ecx * TYPE int]
-		jmp short argloop_start
-		argloop_end:
-
-		call [ebx]ProbeParameters.target_func
-
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		lea esp, [esp + ecx * TYPE int]
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		mov [ecx], eax
-		mov [ecx + 4], edx // since this is 64-bit return value
-		noret:
-
-		pop ebx
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS
+	BRK_PROBE_CALLTARGET
+	BRK_PROBE_REMOVEARGS
+	BRK_PROBE_GETRTNVAL_INT64
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For cdecl that returns single-precision floating-point values
 __declspec(naked) DWORD WINAPI probeCdeclRtnFlt_ptbl(LPVOID) {
-	// For cdecl that returns single-precision floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		push [eax + ecx * TYPE int]
-		jmp short argloop_start
-		argloop_end:
-
-		call [ebx]ProbeParameters.target_func
-
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		lea esp, [esp + ecx * TYPE int]
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		fstp dword ptr [ecx] // since this is a float return value
-		noret:
-
-		pop ebx
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS
+	BRK_PROBE_CALLTARGET
+	BRK_PROBE_REMOVEARGS
+	BRK_PROBE_GETRTNVAL_FLOAT
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For cdecl that returns double-precision floating-point values
 __declspec(naked) DWORD WINAPI probeCdeclRtnDbl_ptbl(LPVOID) {
-	// For cdecl that returns double-precision floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		push [eax + ecx * TYPE int]
-		jmp short argloop_start
-		argloop_end:
-
-		call [ebx]ProbeParameters.target_func
-
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		lea esp, [esp + ecx * TYPE int]
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		fstp qword ptr [ecx] // since this is a double return value
-		noret:
-
-		pop ebx
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS
+	BRK_PROBE_CALLTARGET
+	BRK_PROBE_REMOVEARGS
+	BRK_PROBE_GETRTNVAL_DOUBLE
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For stdcall that returns 32 bit values (int, pointers, etc) that ARE NOT floating-point values
 __declspec(naked) DWORD WINAPI probeStdcall_ptbl(LPVOID) {
-	// Exactly like cdecl version except doesn't clean up target func args
-	__asm {
-		push ebp
-		mov ebp, esp
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		push [eax + ecx * TYPE int]
-		jmp short argloop_start
-		argloop_end:
-
-		call [ebx]ProbeParameters.target_func
-
-		// No need to remove args from stack
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		mov [ecx], eax
-		noret:
-
-		pop ebx
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS
+	BRK_PROBE_CALLTARGET
+	BRK_PROBE_GETRTNVAL_INT
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For stdcall that returns 64 bit structs (__int64, actual structs, etc) that ARE NOT floating-point values
 __declspec(naked) DWORD WINAPI probeStdcallRtn64_ptbl(LPVOID) {
-	// For stdcall that returns 64 bit structs (__int64, actual structs, etc) that ARE NOT floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		push [eax + ecx * TYPE int]
-		jmp short argloop_start
-		argloop_end:
-
-		call [ebx]ProbeParameters.target_func
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		mov [ecx], eax
-		mov [ecx + 4], edx // since this is 64-bit return value
-		noret:
-
-		pop ebx
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS
+	BRK_PROBE_CALLTARGET
+	BRK_PROBE_GETRTNVAL_INT64
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For stdcall that returns single-precision floating-point values
 __declspec(naked) DWORD WINAPI probeStdcallRtnFlt_ptbl(LPVOID) {
-	// For stdcall that returns single-precision floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		push [eax + ecx * TYPE int]
-		jmp short argloop_start
-		argloop_end:
-
-		call [ebx]ProbeParameters.target_func
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		fstp dword ptr [ecx] // since this is a float return value
-		noret:
-
-		pop ebx
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS
+	BRK_PROBE_CALLTARGET
+	BRK_PROBE_GETRTNVAL_FLOAT
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For stdcall that returns double-precision floating-point values
 __declspec(naked) DWORD WINAPI probeStdcallRtnDbl_ptbl(LPVOID) {
-	// For stdcall that returns double-precision floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov ecx, [ebx]ProbeParameters.arg_info
-		and ecx, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		push [eax + ecx * TYPE int]
-		jmp short argloop_start
-		argloop_end:
-
-		call [ebx]ProbeParameters.target_func
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		fstp qword ptr [ecx] // since this is a double return value
-		noret:
-
-		pop ebx
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS
+	BRK_PROBE_CALLTARGET
+	BRK_PROBE_GETRTNVAL_DOUBLE
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For fastcall that returns 32 bit values (int, pointers, etc) that ARE NOT floating-point values
 __declspec(naked) DWORD WINAPI probeFastcall_ptbl(LPVOID) {
-	__asm {
-		push ebp
-		mov ebp, esp
-		push esi // i use it as a scratch reg
-		push edi // i use it as a scratch reg lol
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov esi, [ebx]ProbeParameters.arg_info // have to use esi/edi since I can't mess with value in ecx before the call because it is fastcall
-		and esi, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		mov edi, [ebx]ProbeParameters.arg_info
-		shr edi, 16
-		and edi, 0xff // edi will be second slot index
-
-		mov ebx, [ebx]ProbeParameters.arg_info
-		shr ebx, 8
-		and ebx, 0xff // ebx will be first slot index
-		
-		// loops for each arg slot, and if it is marked as one of the slots that is 4 bytes or less, then put it in the proper register. otherwise, push to stack.
-		argloop_start:
-		dec esi
-		cmp esi, 0
-		jl short argloop_end
-		//
-		cmp esi, ebx // test if first reg arg
-		jne short test_second_reg_arg
-		mov ecx, [eax + esi * TYPE int] // load first reg arg
-		jmp short argloop_start
-		//
-		test_second_reg_arg: // test if second reg arg
-		cmp esi, edi
-		jne short load_stack_arg
-		mov edx, [eax + esi * TYPE int] // load second reg arg
-		jmp short argloop_start
-		//
-		load_stack_arg:
-		push [eax + esi * TYPE int] // push arg onto stack
-		jmp short argloop_start
-		argloop_end:
-
-		mov ebx, [ebp + 8] // probe_params
-		call [ebx]ProbeParameters.target_func
-
-		// No need to remove args from stack
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		mov [ecx], eax
-		noret:
-
-		pop ebx
-		pop edi
-		pop esi
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS_FASTCALL
+	BRK_PROBE_CALLTARGET_FASTCALL
+	BRK_PROBE_GETRTNVAL_INT
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For fastcall that returns 64 bit structs (__int64, actual structs, etc) that ARE NOT floating-point values
 __declspec(naked) DWORD WINAPI probeFastcallRtn64_ptbl(LPVOID) {
-	__asm {
-		push ebp
-		mov ebp, esp
-		push esi // i use it as a scratch reg
-		push edi // i use it as a scratch reg lol
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov esi, [ebx]ProbeParameters.arg_info // have to use esi/edi since I can't mess with value in ecx before the call because it is fastcall
-		and esi, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		mov edi, [ebx]ProbeParameters.arg_info
-		shr edi, 16
-		and edi, 0xff // edi will be second slot index
-
-		mov ebx, [ebx]ProbeParameters.arg_info
-		shr ebx, 8
-		and ebx, 0xff // ebx will be first slot index
-		
-		// loops for each arg slot, and if it is marked as one of the slots that is 4 bytes or less, then put it in the proper register. otherwise, push to stack.
-		argloop_start:
-		dec esi
-		cmp esi, 0
-		jl short argloop_end
-		//
-		cmp esi, ebx // test if first reg arg
-		jne short test_second_reg_arg
-		mov ecx, [eax + esi * TYPE int] // load first reg arg
-		jmp short argloop_start
-		//
-		test_second_reg_arg: // test if second reg arg
-		cmp esi, edi
-		jne short load_stack_arg
-		mov edx, [eax + esi * TYPE int] // load second reg arg
-		jmp short argloop_start
-		//
-		load_stack_arg:
-		push [eax + esi * TYPE int] // push arg onto stack
-		jmp short argloop_start
-		argloop_end:
-
-		mov ebx, [ebp + 8] // probe_params
-		call [ebx]ProbeParameters.target_func
-
-		// No need to remove args from stack
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		mov [ecx], eax
-		mov [ecx + 4], edx // since this is 64-bit return value
-		noret:
-
-		pop ebx
-		pop edi
-		pop esi
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS_FASTCALL
+	BRK_PROBE_CALLTARGET_FASTCALL
+	BRK_PROBE_GETRTNVAL_INT64
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For fastcall that returns single-precision floating-point values
 __declspec(naked) DWORD WINAPI probeFastcallRtnFlt_ptbl(LPVOID) {
-	__asm {
-		push ebp
-		mov ebp, esp
-		push esi // i use it as a scratch reg
-		push edi // i use it as a scratch reg lol
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov esi, [ebx]ProbeParameters.arg_info // have to use esi/edi since I can't mess with value in ecx before the call because it is fastcall
-		and esi, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		mov edi, [ebx]ProbeParameters.arg_info
-		shr edi, 16
-		and edi, 0xff // edi will be second slot index for comparison
-
-		mov ebx, [ebx]ProbeParameters.arg_info
-		shr ebx, 8
-		and ebx, 0xff // ebx will be first slot index for comparison
-		
-		// loops for each arg slot, and if it is marked as one of the slots that is 4 bytes or less, then put it in the proper register. otherwise, push to stack.
-		argloop_start:
-		dec esi
-		cmp esi, 0
-		jl short argloop_end
-		//
-		cmp esi, ebx // test if first reg arg
-		jne short test_second_reg_arg
-		mov ecx, [eax + esi * TYPE int] // load first reg arg
-		jmp short argloop_start
-		//
-		test_second_reg_arg: // test if second reg arg
-		cmp esi, edi
-		jne short load_stack_arg
-		mov edx, [eax + esi * TYPE int] // load second reg arg
-		jmp short argloop_start
-		//
-		load_stack_arg:
-		push [eax + esi * TYPE int] // push arg onto stack
-		jmp short argloop_start
-		argloop_end:
-
-		mov ebx, [ebp + 8] // probe_params
-		call [ebx]ProbeParameters.target_func
-
-		// No need to remove args from stack
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		fstp dword ptr [ecx] // since this is a float return value
-		noret:
-
-		pop ebx
-		pop edi
-		pop esi
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS_FASTCALL
+	BRK_PROBE_CALLTARGET_FASTCALL
+	BRK_PROBE_GETRTNVAL_FLOAT
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
+// For fastcall that returns double-precision floating-point values
 __declspec(naked) DWORD WINAPI probeFastcallRtnDbl_ptbl(LPVOID) {
-	__asm {
-		push ebp
-		mov ebp, esp
-		push esi // i use it as a scratch reg
-		push edi // i use it as a scratch reg lol
-		push ebx
-
-		mov ebx, [ebp + 8] // probe_params
-		mov esi, [ebx]ProbeParameters.arg_info // have to use esi/edi since I can't mess with value in ecx before the call because it is fastcall
-		and esi, 0xff // get nslots from arg_info
-		mov eax, [ebx]ProbeParameters.argdata
-
-		mov edi, [ebx]ProbeParameters.arg_info
-		shr edi, 16
-		and edi, 0xff // edi will be second slot index for comparison
-
-		mov ebx, [ebx]ProbeParameters.arg_info
-		shr ebx, 8
-		and ebx, 0xff // ebx will be first slot index for comparison
-		
-		// loops for each arg slot, and if it is marked as one of the slots that is 4 bytes or less, then put it in the proper register. otherwise, push to stack.
-		argloop_start:
-		dec esi
-		cmp esi, 0
-		jl short argloop_end
-		//
-		cmp esi, ebx // test if first reg arg
-		jne short test_second_reg_arg
-		mov ecx, [eax + esi * TYPE int] // load first reg arg
-		jmp short argloop_start
-		//
-		test_second_reg_arg: // test if second reg arg
-		cmp esi, edi
-		jne short load_stack_arg
-		mov edx, [eax + esi * TYPE int] // load second reg arg
-		jmp short argloop_start
-		//
-		load_stack_arg:
-		push [eax + esi * TYPE int] // push arg onto stack
-		jmp short argloop_start
-		argloop_end:
-
-		mov ebx, [ebp + 8] // probe_params
-		call [ebx]ProbeParameters.target_func
-
-		// No need to remove args from stack
-
-		mov ecx, [ebx]ProbeParameters.rtnval_addr
-		cmp ecx, 0
-		je short noret
-		fstp qword ptr [ecx] // since this is a double return value
-		noret:
-
-		pop ebx
-		pop edi
-		pop esi
-		pop ebp
-		ret 4
-	}
+	BRK_PROBE_STACKFRAME_SETUP
+	BRK_PROBE_LOADPARAMS
+	BRK_PROBE_PREPARGS_FASTCALL
+	BRK_PROBE_CALLTARGET_FASTCALL
+	BRK_PROBE_GETRTNVAL_DOUBLE
+	BRK_PROBE_STACKFRAME_CLEANUP
 }
 
 #pragma endregion
