@@ -74,13 +74,6 @@ typedef struct BridgeData {
 // CreateRemoteThread with a pointer to a ProbeParameters struct
 // passed as the thread argument.
 
-// You will see a lot of repeat asm code throughout these functions.
-// I can't break them into smaller functions, since they need to be
-// portable so that I can just copy one function over to a remote
-// process. I didn't want to make one big probe function with checks
-// for different scenarios because I want remote function calls to be
-// as fast as possible.
-
 // BRICKS
 #pragma region Probe Bricks
 
@@ -89,7 +82,7 @@ typedef struct BridgeData {
 //   - Load argdata and arginfo.nslots from ProbeParameters
 //   - Prepare args for the function call
 //   - Call the target function
-//   - Remove args from stack
+//   - Remove args from stack if necessary
 //   - Retrieve return value
 //   - Clean up stack frame, return
 
@@ -359,1422 +352,552 @@ __declspec(naked) DWORD WINAPI probeFastcallRtnDbl_ptbl(LPVOID) {
 // be patched into it, so it is best to use bridges by creating new
 // ones through bridge creation functions.
 
-// You will see a lot of repeat code throughout these functions.
-// I can't break them into smaller functions, since they need to be
-// portable so that I can just copy one function over to a remote
-// process. I didn't want to make one big bridge function with checks
-// for different scenarios because I want remote function calls to be
-// as fast as possible.
+// BRICKS
+#pragma region Bridge Bricks
+
+// Set up stack and preserve registers
+#define BRK_BRIDGE_A __asm {    \
+	__asm push ebp              \
+	__asm mov ebp, esp          \
+	__asm sub esp, __LOCAL_SIZE \
+	__asm push ebx              \
+	__asm push esi              \
+	__asm push edi              \
+}
+
+#define BRK_BRIDGE_B_FASTCALL __asm {              \
+	__asm push edx /* store to be handled later */ \
+	__asm push ecx /* store to be handled later */ \
+}
+
+// Declare variables all at once because this is for naked function
+#define BRK_BRIDGE_C                     \
+	BridgeData* bridge_data;             \
+	ProbeParameters* local_probe_params; \
+	int argdata_size;                    \
+	void** local_probe_argdata;          \
+	void* rmt_allocated_chonk;           \
+	void* rmt_probe_params;              \
+	void* rmt_probe_func;                \
+	HANDLE rmt_thread_handle;
+
+#define BRK_BRIDGE_D_FASTCALL     \
+	int arg_first_idx;            \
+	int arg_second_idx;           \
+	int arg_reg_count;
+
+#define BRK_BRIDGE_E_INTFLT   int rtn_value;
+#define BRK_BRIDGE_E_INT64DBL __int64 rtn_value;
+
+#define BRK_BRIDGE_F                                                                                                                                            \
+	/* Address of BridgeData struct to be patched in when function is copied, done in asm to avoid problematic compiler optimization */                         \
+	__asm { mov bridge_data, 0xBAADB00F }                                                                                                                       \
+	                                                                                                                                                            \
+	/* Allocate local ProbeParameters struct and write the target function address into the struct */                                                           \
+	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)); \
+	local_probe_params->target_func = bridge_data->target_func;
+
+// Copy the arg info to the probe parameters, and adjust the nslots if a handle is to be passed
+#define BRK_BRIDGE_G_CDECLSTDCALL                                 \
+	local_probe_params->arg_info = bridge_data->arg_info;         \
+	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)      \
+		local_probe_params->arg_info += bridge_data->pass_handle;
+//
+#define BRK_BRIDGE_G_FASTCALL                                                            \
+	local_probe_params->arg_info = bridge_data->arg_info;                                \
+	if (bridge_data->pass_handle) {                                                      \
+		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)                         \
+			local_probe_params->arg_info += 1; /* nslots + 1 */                          \
+	                                                                                     \
+		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {                        \
+			/* set idx2 to current idx1, then set idx1 to 0x00 */                        \
+			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) | \
+				((local_probe_params->arg_info << 8) & 0x00ff0000);                      \
+		}                                                                                \
+	}
+
+#define BRK_BRIDGE_H                                                                                                                                            \
+	/* Calculate size of memory chunk needed to store args */                                                                                                   \
+	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);                                                                                \
+	                                                                                                                                                            \
+	/* Allocate space locally for argument data */                                                                                                              \
+	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));                     \
+	/* If local handle is to be passed to target function, then add it to args... also adjust the start addr of the arg data chunk to simplify the asm ahead */ \
+	if (bridge_data->pass_handle) {                                                                                                                             \
+		local_probe_argdata[0] = bridge_data->local_handle;                                                                                                     \
+		local_probe_argdata += 1;  /* hacky but efficient k don't @ me */                                                                                       \
+	}
+
+
+// Read args from stack into allocated argument data chunk
+#define BRK_BRIDGE_I_CDECLSTDCALL                                     \
+	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) { \
+		__asm {                                                       \
+			__asm mov ecx, [i]                                        \
+			__asm shl ecx, 2                                          \
+			__asm mov eax, [ebp + 8 + ecx]                            \
+			__asm mov edx, [local_probe_argdata]                      \
+			__asm mov[edx + ecx], eax                                 \
+		}                                                             \
+	}
+//
+#define BRK_BRIDGE_I_FASTCALL                                                                                          \
+	arg_first_idx = ARGINFO_IDX1(bridge_data->arg_info); /* slot index of arg passed through ecx */                    \
+	arg_second_idx = ARGINFO_IDX2(bridge_data->arg_info); /* slot index of arg passed through edx */                   \
+	arg_reg_count = 0; /* to be set to number of arguments passed in registers */                                      \
+	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {                                                  \
+		__asm {                                                                                                        \
+			__asm mov ecx, [i]                                                                                         \
+	                                                                                                                   \
+			/* test if this is the arg that was passed through ecx, if so then retrieve, and write to argdata chunk */ \
+			__asm mov eax, [arg_first_idx]                                                                             \
+			__asm cmp eax, ecx                                                                                         \
+			__asm jne short arg_test_second                                                                            \
+			__asm mov edx, [local_probe_argdata]                                                                       \
+			__asm mov eax, [esp] /* stored value of ecx */                                                             \
+			__asm mov [edx + ecx * TYPE int], eax                                                                      \
+			__asm inc [arg_reg_count]                                                                                  \
+			__asm jmp short cont                                                                                       \
+	                                                                                                                   \
+			/* test if this is the arg that was passed through edx, if so then retrieve, and write to argdata chunk */ \
+			__asm arg_test_second:                                                                                     \
+			__asm mov eax, [arg_second_idx]                                                                            \
+			__asm cmp eax, ecx                                                                                         \
+			__asm jne short arg_stk_copy                                                                               \
+			__asm mov edx, [local_probe_argdata]                                                                       \
+			__asm mov eax, [esp + 4] /* stored value of edx */                                                         \
+			__asm mov [edx + ecx * TYPE int], eax                                                                      \
+			__asm inc [arg_reg_count]                                                                                  \
+			__asm jmp short cont                                                                                       \
+	                                                                                                                   \
+			/* retrieve arg that was passed to this function via the stack and write to argdata chunk */               \
+			__asm arg_stk_copy:                                                                                        \
+			__asm mov edx, [local_probe_argdata]                                                                       \
+			__asm sub ecx, [arg_reg_count]                                                                             \
+			__asm shl ecx, 2                                                                                           \
+			__asm mov eax, [ebp + 8 + ecx] /* value of the arg passed on the stack */                                  \
+			__asm shr ecx, 2                                                                                           \
+			__asm add ecx, [arg_reg_count]                                                                             \
+			__asm shl ecx, 2                                                                                           \
+			__asm mov [edx + ecx], eax                                                                                 \
+	                                                                                                                   \
+			__asm cont: /* continue with loop */                                                                       \
+		}                                                                                                              \
+	}
+
+// If local handle is to be passed, re-adjust the start addr of the arg data chunk to how it should be
+#define BRK_BRIDGE_J              \
+	if (bridge_data->pass_handle) \
+		local_probe_argdata -= 1;
+
+// Allocate space for argdata, return value, probe params, and probe func inside remote process all in one call and easy to clean up data chonk
+#define BRK_BRIDGE_K_INTFLT                                                                                 \
+	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0, \
+		argdata_size + 4 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,                    \
+		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+//
+#define BRK_BRIDGE_K_INT64DBL                                                                               \
+	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0, \
+		argdata_size + 8 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,                    \
+		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+
+#define BRK_BRIDGE_L                                                                                                           \
+	/* Set up the probe params struct to know the address of the allocated space for argdata, */                                   \
+	/* and copy the local argument data to that remote space */                                                                    \
+	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);                                                   \
+	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0); \
+	                                                                                                                               \
+	/* Set up the probe params struct to know the address of the allocated space for the return value, */                          \
+	/* and store so that the retval can be read once the rmt function returns */                                                   \
+	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
+
+// Store the address of the allocated space for the rmt probe params
+#define BRK_BRIDGE_M_INTFLT \
+	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
+//
+#define BRK_BRIDGE_M_INT64DBL \
+	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
+
+// Copy the local probe params struct to rmt
+#define BRK_BRIDGE_N \
+	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
+
+// If the probe func size is set to zero, that means that the probe func already exists in the rmt process and doesn't need to be copied. Otherwise, copy it over.
+#define BRK_BRIDGE_O_INTFLT                                                                                                                         \
+	if (bridge_data->local_probe_func_size) {                                                                                                       \
+		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4 + sizeof(ProbeParameters));     \
+		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0); \
+	} else {                                                                                                                                        \
+		rmt_probe_func = bridge_data->probe_func;                                                                                                   \
+	}
+#define BRK_BRIDGE_O_INT64DBL                                                                                                                       \
+	if (bridge_data->local_probe_func_size) {                                                                                                       \
+		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8 + sizeof(ProbeParameters));     \
+		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0); \
+	} else {                                                                                                                                        \
+		rmt_probe_func = bridge_data->probe_func;                                                                                                   \
+	}
+
+// Create new remote thread starting on the remote probe function, pass the address of the remote ProbeParameters struct to the remote probe function
+#define BRK_BRIDGE_P                                                                                                              \
+	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0); \
+	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);                                                              \
+	rtn_value = 0;
+
+// Retrieve return value from remote process
+#define BRK_BRIDGE_Q_INTFLT \
+	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
+//
+#define BRK_BRIDGE_Q_INT64DBL \
+	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
+
+// Free all left over allocated space
+#define BRK_BRIDGE_R                                                                            \
+	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE); \
+	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);                             \
+	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+// Properly pass the return value
+#define BRK_BRIDGE_S_INT __asm mov eax, [rtn_value]
+#define BRK_BRIDGE_S_INT64 __asm { \
+	__asm lea ecx, [rtn_value]     \
+	__asm mov eax, [ecx]           \
+	__asm mov edx, [ecx + 4]       \
+}
+#define BRK_BRIDGE_S_FLT __asm fld dword ptr[rtn_value]
+#define BRK_BRIDGE_S_DBL __asm fld qword ptr[rtn_value]
+
+// Clean up stack
+#define BRK_BRIDGE_T_STDCALLFASTCALL __asm {                                  \
+	__asm mov ecx, [bridge_data]                                              \
+	__asm mov ecx, [ecx]BridgeData.arg_info                                   \
+	__asm and ecx, 0xff /* get nslots from arg info for later arg clearing */ \
+}
+//
+#define BRK_BRIDGE_U_FASTCALL __asm {                                                                \
+	__asm sub ecx, [arg_reg_count] /* adjust to be number of slots that are actually on the stack */ \
+                                                                                                     \
+	__asm add esp, 8 /* because I pushed ecx and edx to save their values */                         \
+}
+
+// Restore registers
+#define BRK_BRIDGE_V __asm { \
+	__asm pop edi            \
+	__asm pop esi            \
+	__asm pop ebx            \
+	__asm mov esp, ebp       \
+	__asm pop ebp            \
+}
+
+// very hacky way to clear args off of stack while keeping the return address on top
+// has to be hacky like this since I want to actually use ret and not fake it with a jmp
+#define BRK_BRIDGE_W_STDCALLFASTCALL __asm { \
+	__asm argloop_start:                     \
+	__asm dec ecx                            \
+	__asm cmp ecx, 0                         \
+	__asm jl short argloop_end               \
+	__asm pop dword ptr [esp]                \
+	__asm jmp short argloop_start            \
+	__asm argloop_end:                       \
+}
+
+#define BRK_BRIDGE_X __asm ret
+
+#pragma endregion
+
+// FUNCTIONS
 #pragma region Bridge Functions
 
 __declspec(naked) void* __cdecl bridgeCdecl_ptbl() {
-	// Set up stack and preserve registers
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-	}
-
-	// Declare variables at top because this is a naked function
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	int rtn_value;
-
-	// Address of BridgeData struct to be patched in when function is copied
-	// Have to do this instead of regular variable assignment to avoid problematic compiler optimizations
-	__asm mov bridge_data, 0xBAADB00F
-
-	// Allocate local ProbeParameters struct and write the target function address into the struct
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	// Copy the arg info to the probe parameters, and adjust the nslots if a handle is to be passed
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params->arg_info += bridge_data->pass_handle;
-
-	// Calculate size of memory chunk needed to store args
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	// Allocate space locally for argument data
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	// If local handle is to be passed to target function, then add it to args... also adjust the start addr of the arg data chunk to simplify the asm ahead
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;  // hacky but efficient k don't @ me
-	}
-	// Read args from stack into allocated argument data chunk
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx]
-			mov edx, [local_probe_argdata]
-			mov [edx + ecx], eax
-		}
-	}
-	// If local handle is to be passed, re-adjust the start addr of the arg data chunk to how it should be
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	// Allocate space for argdata, return value, probe params, and probe func inside remote process all in one call and easy to clean up data chonk
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 4 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-
-	// Set up the probe params struct to know the address of the allocated space for argdata, and copy the local argument data to that remote space
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	// Set up the probe params struct to know the address of the allocated space for the return value, and store so that the retval can be read once the rmt function returns
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	// Store the address of the allocated space for the rmt probe params and then copy the local struct to rmt
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	// If the probe func size is set to zero, that means that the probe func already exists in the rmt process and doesn't need to be copied. Otherwise, copy it over.
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	// Create new remote thread starting on the remote probe function, pass the address of the remote ProbeParameters struct to the remote probe function
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	// Retrieve return value from remote process
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
-
-	// Free all left over allocated space
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	// Return the return value, restore registers, clean up stack, and return
-	__asm {
-		mov eax, [rtn_value]
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-		ret
-	}
+	BRK_BRIDGE_A
+	BRK_BRIDGE_C
+	BRK_BRIDGE_E_INTFLT
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_CDECLSTDCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_CDECLSTDCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INTFLT
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INTFLT
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INTFLT
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INTFLT
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_INT
+	BRK_BRIDGE_V
+	BRK_BRIDGE_X
 }
 
-__declspec(naked) void* __stdcall bridgeCdeclRtn64_ptbl() {
-	// For cdecl that returns 64 bit structs (__int64, actual structs, etc) that ARE NOT floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	__int64 rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params->arg_info += bridge_data->pass_handle;
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx]
-			mov edx, [local_probe_argdata]
-			mov[edx + ecx], eax
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 8 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)); // note the 8 bytes for return value
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	__asm {
-		lea ecx, [rtn_value] // have to do things weird like this because retn_value is 64 bits
-		mov eax, [ecx]
-		mov edx, [ecx + 4]
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-		ret
-	}
+__declspec(naked) void* __cdecl bridgeCdeclRtn64_ptbl() {
+	BRK_BRIDGE_A
+	BRK_BRIDGE_C
+	BRK_BRIDGE_E_INT64DBL
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_CDECLSTDCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_CDECLSTDCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INT64DBL
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INT64DBL
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INT64DBL
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INT64DBL
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_INT64
+	BRK_BRIDGE_V
+	BRK_BRIDGE_X
 }
 
-__declspec(naked) void* __stdcall bridgeCdeclRtnFlt_ptbl() {
-	// For cdecl that returns single-precision floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	int rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params->arg_info += bridge_data->pass_handle;
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx]
-			mov edx, [local_probe_argdata]
-			mov[edx + ecx], eax
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 4 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)); // note the 4 bytes for return value
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	__asm {
-		fld dword ptr [rtn_value] // because rtn_value is a float
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-		ret
-	}
+__declspec(naked) void* __cdecl bridgeCdeclRtnFlt_ptbl() {
+	BRK_BRIDGE_A
+	BRK_BRIDGE_C
+	BRK_BRIDGE_E_INTFLT
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_CDECLSTDCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_CDECLSTDCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INTFLT
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INTFLT
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INTFLT
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INTFLT
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_FLT
+	BRK_BRIDGE_V
+	BRK_BRIDGE_X
 }
 
-__declspec(naked) void* __stdcall bridgeCdeclRtnDbl_ptbl() {
-	// For cdecl that returns double-precision floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	__int64 rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params->arg_info += bridge_data->pass_handle;
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx]
-			mov edx, [local_probe_argdata]
-			mov[edx + ecx], eax
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 8 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)); // note the 8 bytes for return value
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	__asm {
-		fld qword ptr [rtn_value] // because rtn_value is a double
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-		ret
-	}
+__declspec(naked) void* __cdecl bridgeCdeclRtnDbl_ptbl() {
+	BRK_BRIDGE_A
+	BRK_BRIDGE_C
+	BRK_BRIDGE_E_INT64DBL
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_CDECLSTDCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_CDECLSTDCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INT64DBL
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INT64DBL
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INT64DBL
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INT64DBL
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_DBL
+	BRK_BRIDGE_V
+	BRK_BRIDGE_X
 }
 
 __declspec(naked) void* __stdcall bridgeStdcall_ptbl() {
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	int rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params->arg_info += bridge_data->pass_handle;
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx]
-			mov edx, [local_probe_argdata]
-			mov[edx + ecx], eax
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 4 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	// This was difficult since stdcall is callee-cleanup and not meant to be have variable number of args
-	// ... so I had to do some hacky stuff to get it to return but also clean up args
-	__asm {
-		mov eax, [rtn_value]
-
-		mov ecx, [bridge_data]
-		mov ecx, [ecx]BridgeData.arg_info
-		and ecx, 0xff // get nslots from arg info for later arg clearing
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-		
-		// very hacky way to clear args off of stack while keeping the return address on top
-		// has to be hacky like this since I want to actually use ret and not fake it with a jmp
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		pop dword ptr [esp]
-		jmp short argloop_start
-		argloop_end:
-
-		ret
-	}
+	BRK_BRIDGE_A
+	BRK_BRIDGE_C
+	BRK_BRIDGE_E_INTFLT
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_CDECLSTDCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_CDECLSTDCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INTFLT
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INTFLT
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INTFLT
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INTFLT
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_INT
+	BRK_BRIDGE_T_STDCALLFASTCALL
+	BRK_BRIDGE_V
+	BRK_BRIDGE_W_STDCALLFASTCALL
+	BRK_BRIDGE_X
 }
 
 __declspec(naked) void* __stdcall bridgeStdcallRtn64_ptbl() {
-	// For stdcall that returns 64 bit structs (__int64, actual structs, etc) that ARE NOT floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	__int64 rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params->arg_info += bridge_data->pass_handle;
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx]
-			mov edx, [local_probe_argdata]
-			mov[edx + ecx], eax
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 8 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)); // note the 8 bytes for return value
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	__asm {
-		lea ecx, [rtn_value] // have to do things weird like this because retn_value is 64 bits
-		mov eax, [ecx]
-		mov edx, [ecx + 4]
-
-		mov ecx, [bridge_data]
-		mov ecx, [ecx]BridgeData.arg_info
-		and ecx, 0xff // get nslots from arg info for later arg clearing
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-
-		// very hacky way to clear args off of stack while keeping the return address on top
-		// has to be hacky like this since the only register I can use is ecx AND I want to actually
-		// use a ret, not fake it with a jmp
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		pop dword ptr [esp]
-		jmp short argloop_start
-		argloop_end:
-
-		ret
-	}
+	BRK_BRIDGE_A
+	BRK_BRIDGE_C
+	BRK_BRIDGE_E_INT64DBL
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_CDECLSTDCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_CDECLSTDCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INT64DBL
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INT64DBL
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INT64DBL
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INT64DBL
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_INT64
+	BRK_BRIDGE_T_STDCALLFASTCALL
+	BRK_BRIDGE_V
+	BRK_BRIDGE_W_STDCALLFASTCALL
+	BRK_BRIDGE_X
 }
 
 __declspec(naked) void* __stdcall bridgeStdcallRtnFlt_ptbl() {
-	// For stdcall that returns single-precision floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	int rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params->arg_info += bridge_data->pass_handle;
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx]
-			mov edx, [local_probe_argdata]
-			mov[edx + ecx], eax
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 4 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)); // 4 bytes for return value because it is a float
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	__asm {
-		fld dword ptr [rtn_value] // because rtn_value is a float
-
-		mov ecx, [bridge_data]
-		mov ecx, [ecx]BridgeData.arg_info
-		and ecx, 0xff // get nslots from arg info for later arg clearing
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-
-		// very hacky way to clear args off of stack while keeping the return address on top
-		// don't want to fake a ret with a jmp for performance reasons so...
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		pop dword ptr [esp]
-		jmp short argloop_start
-		argloop_end:
-
-		ret
-	}
+	BRK_BRIDGE_A
+	BRK_BRIDGE_C
+	BRK_BRIDGE_E_INTFLT
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_CDECLSTDCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_CDECLSTDCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INTFLT
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INTFLT
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INTFLT
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INTFLT
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_FLT
+	BRK_BRIDGE_T_STDCALLFASTCALL
+	BRK_BRIDGE_V
+	BRK_BRIDGE_W_STDCALLFASTCALL
+	BRK_BRIDGE_X
 }
 
 __declspec(naked) void* __stdcall bridgeStdcallRtnDbl_ptbl() {
-	// For stdcall that returns double-precision floating-point values
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	__int64 rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-		local_probe_params->arg_info += bridge_data->pass_handle;
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx]
-			mov edx, [local_probe_argdata]
-			mov[edx + ecx], eax
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 8 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)); // 8 bytes for return value because it is double
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	__asm {
-		fld qword ptr [rtn_value] // because rtn_value is a double
-
-		mov ecx, [bridge_data]
-		mov ecx, [ecx]BridgeData.arg_info
-		and ecx, 0xff // get nslots from arg info for later arg clearing
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-
-		// very hacky way to clear args off of stack while keeping the return address on top
-		// don't want to fake a ret with a jmp for performance reasons so...
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		pop dword ptr [esp]
-		jmp short argloop_start
-		argloop_end:
-
-		ret
-	}
+	BRK_BRIDGE_A
+	BRK_BRIDGE_C
+	BRK_BRIDGE_E_INT64DBL
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_CDECLSTDCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_CDECLSTDCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INT64DBL
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INT64DBL
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INT64DBL
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INT64DBL
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_DBL
+	BRK_BRIDGE_T_STDCALLFASTCALL
+	BRK_BRIDGE_V
+	BRK_BRIDGE_W_STDCALLFASTCALL
+	BRK_BRIDGE_X
 }
 
 __declspec(naked) void* __fastcall bridgeFastcall_ptbl() {
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-
-		push edx // store edx to be handled later
-		push ecx // store ecx to be handled later
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	int arg_first_idx;
-	int arg_second_idx;
-	int arg_reg_count;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	int rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (bridge_data->pass_handle) {
-		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-			local_probe_params->arg_info += 1; // nslots + 1
-
-		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {
-			// set idx2 to current idx1, then set idx1 to 0x00
-			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) | ((local_probe_params->arg_info << 8) & 0x00ff0000);
-		}
-	}
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	arg_first_idx = ARGINFO_IDX1(bridge_data->arg_info); // slot index of arg passed through ecx
-	arg_second_idx = ARGINFO_IDX2(bridge_data->arg_info); // slot index of arg passed through edx
-	arg_reg_count = 0; // to be set to number of arguments passed in registers
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-
-			// test if this is the arg that was passed through ecx, if so then retrieve, and write to argdata chunk
-			mov eax, [arg_first_idx]
-			cmp eax, ecx
-			jne short arg_test_second
-			mov edx, [local_probe_argdata]
-			mov eax, [esp] // stored value of ecx
-			mov [edx + ecx * TYPE int], eax
-			inc [arg_reg_count]
-			jmp short cont
-
-			// test if this is the arg that was passed through edx, if so then retrieve, and write to argdata chunk
-			arg_test_second:
-			mov eax, [arg_second_idx]
-			cmp eax, ecx
-			jne short arg_stk_copy
-			mov edx, [local_probe_argdata]
-			mov eax, [esp + 4] // stored value of edx
-			mov [edx + ecx * TYPE int], eax
-			inc [arg_reg_count]
-			jmp short cont
-
-			// retrieve arg that was passed to this function via the stack and write to argdata chunk
-			arg_stk_copy:
-			mov edx, [local_probe_argdata]
-			sub ecx, [arg_reg_count]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx] // value of the arg passed on the stack
-			shr ecx, 2
-			add ecx, [arg_reg_count]
-			shl ecx, 2
-			mov [edx + ecx], eax // ik, the shifts were a bit excessive but i havent slept and dont wanna think hard
-
-			cont: // continue with loop
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 4 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	__asm {
-		mov eax, [rtn_value]
-
-		mov ecx, [bridge_data]
-		mov ecx, [ecx]BridgeData.arg_info
-		and ecx, 0xff // get nslots from arg info for later clearing
-		sub ecx, [arg_reg_count] // adjust to be number of slots that are actually on the stack
-
-		add esp, 8 // because I pushed ecx and edx to save their values
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-		
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		pop dword ptr [esp]
-		jmp short argloop_start
-		argloop_end:
-
-		ret
-	}
+	BRK_BRIDGE_A
+	BRK_BRIDGE_B_FASTCALL
+	BRK_BRIDGE_C
+	BRK_BRIDGE_D_FASTCALL
+	BRK_BRIDGE_E_INTFLT
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_FASTCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_FASTCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INTFLT
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INTFLT
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INTFLT
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INTFLT
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_INT
+	BRK_BRIDGE_T_STDCALLFASTCALL
+	BRK_BRIDGE_U_FASTCALL
+	BRK_BRIDGE_V
+	BRK_BRIDGE_W_STDCALLFASTCALL
+	BRK_BRIDGE_X
 }
 
 __declspec(naked) void* __fastcall bridgeFastcallRtn64_ptbl() {
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-
-		push edx // store edx to be handled later
-		push ecx // store ecx to be handled later
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	int arg_first_idx;
-	int arg_second_idx;
-	int arg_reg_count;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	__int64 rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (bridge_data->pass_handle) {
-		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-			local_probe_params->arg_info += 1; // nslots + 1
-
-		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {
-			// set idx2 to current idx1, then set idx1 to 0x00
-			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) | ((local_probe_params->arg_info << 8) & 0x00ff0000);
-		}
-	}
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	arg_first_idx = ARGINFO_IDX1(bridge_data->arg_info); // slot index of arg passed through ecx
-	arg_second_idx = ARGINFO_IDX2(bridge_data->arg_info); // slot index of arg passed through edx
-	arg_reg_count = 0; // to be set with number of args passed in registers
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-
-			// test if this is the arg that was passed through ecx, if so then retrieve, and write to argdata chunk
-			mov eax, [arg_first_idx]
-			cmp eax, ecx
-			jne short arg_test_second
-			mov edx, [local_probe_argdata]
-			mov eax, [esp] // stored value of ecx
-			mov [edx + ecx * TYPE int], eax
-			inc [arg_reg_count]
-			jmp short cont
-
-			// test if this is the arg that was passed through edx, if so then retrieve, and write to argdata chunk
-			arg_test_second:
-			mov eax, [arg_second_idx]
-			cmp eax, ecx
-			jne short arg_stk_copy
-			mov edx, [local_probe_argdata]
-			mov eax, [esp + 4] // stored value of edx
-			mov [edx + ecx * TYPE int], eax
-			inc [arg_reg_count]
-			jmp short cont
-
-			// retrieve arg that was passed to this function via the stack and write to argdata chunk
-			arg_stk_copy:
-			mov edx, [local_probe_argdata]
-			sub ecx, [arg_reg_count]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx] // value of the arg passed on the stack
-			shr ecx, 2
-			add ecx, [arg_reg_count]
-			shl ecx, 2
-			mov [edx + ecx], eax // ik, the shifts were a bit excessive but i havent slept and dont wanna think hard
-
-			cont: // continue with loop
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 8 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	__asm {
-		lea ecx, [rtn_value] // have to do things weird like this because retn_value is 64 bits
-		mov eax, [ecx]
-		mov edx, [ecx + 4]
-
-		mov ecx, [bridge_data]
-		mov ecx, [ecx]BridgeData.arg_info
-		and ecx, 0xff // get nslots from arg info for later clearing
-		sub ecx, [arg_reg_count] // adjust to be number of slots that are actually on the stack
-
-		add esp, 8
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-		
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		pop dword ptr [esp]
-		jmp short argloop_start
-		argloop_end:
-
-		ret
-	}
+	BRK_BRIDGE_A
+	BRK_BRIDGE_B_FASTCALL
+	BRK_BRIDGE_C
+	BRK_BRIDGE_D_FASTCALL
+	BRK_BRIDGE_E_INT64DBL
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_FASTCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_FASTCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INT64DBL
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INT64DBL
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INT64DBL
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INT64DBL
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_INT64
+	BRK_BRIDGE_T_STDCALLFASTCALL
+	BRK_BRIDGE_U_FASTCALL
+	BRK_BRIDGE_V
+	BRK_BRIDGE_W_STDCALLFASTCALL
+	BRK_BRIDGE_X
 }
 
 __declspec(naked) void* __fastcall bridgeFastcallRtnFlt_ptbl() {
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-
-		push edx // store edx to be handled later
-		push ecx // store ecx to be handled later
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	int arg_first_idx;
-	int arg_second_idx;
-	int arg_reg_count;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	__int64 rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (bridge_data->pass_handle) {
-		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-			local_probe_params->arg_info += 1; // nslots + 1
-
-		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {
-			// set idx2 to current idx1, then set idx1 to 0x00
-			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) | ((local_probe_params->arg_info << 8) & 0x00ff0000);
-		}
-	}
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	arg_first_idx = ARGINFO_IDX1(bridge_data->arg_info); // slot index of arg passed through ecx
-	arg_second_idx = ARGINFO_IDX2(bridge_data->arg_info); // slot index of arg passed through edx
-	arg_reg_count = 0; // to track where to find the args passed on the stack
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-
-			// test if this is the arg that was passed through ecx, if so then retrieve, and write to argdata chunk
-			mov eax, [arg_first_idx]
-			cmp eax, ecx
-			jne short arg_test_second
-			mov edx, [local_probe_argdata]
-			mov eax, [esp] // stored value of ecx
-			mov [edx + ecx * TYPE int], eax
-			inc [arg_reg_count]
-			jmp short cont
-
-			// test if this is the arg that was passed through edx, if so then retrieve, and write to argdata chunk
-			arg_test_second:
-			mov eax, [arg_second_idx]
-			cmp eax, ecx
-			jne short arg_stk_copy
-			mov edx, [local_probe_argdata]
-			mov eax, [esp + 4] // stored value of edx
-			mov [edx + ecx * TYPE int], eax
-			inc [arg_reg_count]
-			jmp short cont
-
-			// retrieve arg that was passed to this function via the stack and write to argdata chunk
-			arg_stk_copy:
-			mov edx, [local_probe_argdata]
-			sub ecx, [arg_reg_count]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx] // value of the arg passed on the stack
-			shr ecx, 2
-			add ecx, [arg_reg_count]
-			shl ecx, 2
-			mov [edx + ecx], eax // ik, the shifts were a bit excessive but i havent slept and dont wanna think hard
-
-			cont: // continue with loop
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 4 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	__asm {
-		fld dword ptr [rtn_value] // because rtn_value is a float
-
-		mov ecx, [bridge_data]
-		mov ecx, [ecx]BridgeData.arg_info
-		and ecx, 0xff // get nslots from arg info for later clearing
-		sub ecx, [arg_reg_count] // adjust to be number of slots that are actually on the stack
-
-		add esp, 8
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-		
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		pop dword ptr [esp]
-		jmp short argloop_start
-		argloop_end:
-
-		ret
-	}
+	BRK_BRIDGE_A
+	BRK_BRIDGE_B_FASTCALL
+	BRK_BRIDGE_C
+	BRK_BRIDGE_D_FASTCALL
+	BRK_BRIDGE_E_INTFLT
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_FASTCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_FASTCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INTFLT
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INTFLT
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INTFLT
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INTFLT
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_FLT
+	BRK_BRIDGE_T_STDCALLFASTCALL
+	BRK_BRIDGE_U_FASTCALL
+	BRK_BRIDGE_V
+	BRK_BRIDGE_W_STDCALLFASTCALL
+	BRK_BRIDGE_X
 }
 
 __declspec(naked) void* __fastcall bridgeFastcallRtnDbl_ptbl() {
-	__asm {
-		push ebp
-		mov ebp, esp
-		sub esp, __LOCAL_SIZE
-		push ebx
-		push esi
-		push edi
-
-		push edx // store edx to be handled later
-		push ecx // store ecx to be handled later
-	}
-
-	BridgeData* bridge_data;
-	ProbeParameters* local_probe_params;
-	int argdata_size;
-	void** local_probe_argdata;
-	int arg_first_idx;
-	int arg_second_idx;
-	int arg_reg_count;
-	void* rmt_allocated_chonk;
-	void* rmt_probe_params;
-	void* rmt_probe_func;
-	HANDLE rmt_thread_handle;
-	__int64 rtn_value;
-
-	__asm mov bridge_data, 0xBAADB00F
-
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	local_probe_params->target_func = bridge_data->target_func;
-
-	local_probe_params->arg_info = bridge_data->arg_info;
-	if (bridge_data->pass_handle) {
-		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)
-			local_probe_params->arg_info += 1; // nslots + 1
-
-		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {
-			// set idx2 to current idx1, then set idx1 to 0x00
-			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) | ((local_probe_params->arg_info << 8) & 0x00ff0000);
-		}
-	}
-
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);
-
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-	if (bridge_data->pass_handle) {
-		local_probe_argdata[0] = bridge_data->local_handle;
-		local_probe_argdata += 1;
-	}
-	arg_first_idx = ARGINFO_IDX1(bridge_data->arg_info); // slot index of arg passed through ecx
-	arg_second_idx = ARGINFO_IDX2(bridge_data->arg_info); // slot index of arg passed through edx
-	arg_reg_count = 0; // to track where to find the args passed on the stack
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {
-		__asm {
-			mov ecx, [i]
-
-			// test if this is the arg that was passed through ecx, if so then retrieve, and write to argdata chunk
-			mov eax, [arg_first_idx]
-			cmp eax, ecx
-			jne short arg_test_second
-			mov edx, [local_probe_argdata]
-			mov eax, [esp] // stored value of ecx
-			mov [edx + ecx * TYPE int], eax
-			inc [arg_reg_count]
-			jmp short cont
-
-			// test if this is the arg that was passed through edx, if so then retrieve, and write to argdata chunk
-			arg_test_second:
-			mov eax, [arg_second_idx]
-			cmp eax, ecx
-			jne short arg_stk_copy
-			mov edx, [local_probe_argdata]
-			mov eax, [esp + 4] // stored value of edx
-			mov [edx + ecx * TYPE int], eax
-			inc [arg_reg_count]
-			jmp short cont
-
-			// retrieve arg that was passed to this function via the stack and write to argdata chunk
-			arg_stk_copy:
-			mov edx, [local_probe_argdata]
-			sub ecx, [arg_reg_count]
-			shl ecx, 2
-			mov eax, [ebp + 8 + ecx] // value of the arg passed on the stack
-			shr ecx, 2
-			add ecx, [arg_reg_count]
-			shl ecx, 2
-			mov [edx + ecx], eax // ik, the shifts were a bit excessive but i havent slept and dont wanna think hard
-
-			cont: // continue with loop
-		}
-	}
-	if (bridge_data->pass_handle)
-		local_probe_argdata -= 1;
-
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
-		argdata_size + 8 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
-		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);
-
-	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
-
-	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
-
-	if (bridge_data->local_probe_func_size) {
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8 + sizeof(ProbeParameters));
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);
-	} else {
-		rmt_probe_func = bridge_data->probe_func;
-	}
-
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
-
-	rtn_value = 0;
-	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
-
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
-	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
-
-	__asm {
-		fld qword ptr [rtn_value] // because rtn_value is a double
-
-		mov ecx, [bridge_data]
-		mov ecx, [ecx]BridgeData.arg_info
-		and ecx, 0xff // get nslots from arg info for later clearing
-		sub ecx, [arg_reg_count] // adjust to be number of slots that are actually on the stack
-
-		add esp, 8
-
-		pop edi
-		pop esi
-		pop ebx
-		mov esp, ebp
-		pop ebp
-		
-		argloop_start:
-		dec ecx
-		cmp ecx, 0
-		jl short argloop_end
-		pop dword ptr [esp]
-		jmp short argloop_start
-		argloop_end:
-
-		ret
-	}
+	BRK_BRIDGE_A
+	BRK_BRIDGE_B_FASTCALL
+	BRK_BRIDGE_C
+	BRK_BRIDGE_D_FASTCALL
+	BRK_BRIDGE_E_INT64DBL
+	BRK_BRIDGE_F
+	BRK_BRIDGE_G_FASTCALL
+	BRK_BRIDGE_H
+	BRK_BRIDGE_I_FASTCALL
+	BRK_BRIDGE_J
+	BRK_BRIDGE_K_INT64DBL
+	BRK_BRIDGE_L
+	BRK_BRIDGE_M_INT64DBL
+	BRK_BRIDGE_N
+	BRK_BRIDGE_O_INT64DBL
+	BRK_BRIDGE_P
+	BRK_BRIDGE_Q_INT64DBL
+	BRK_BRIDGE_R
+	BRK_BRIDGE_S_DBL
+	BRK_BRIDGE_T_STDCALLFASTCALL
+	BRK_BRIDGE_U_FASTCALL
+	BRK_BRIDGE_V
+	BRK_BRIDGE_W_STDCALLFASTCALL
+	BRK_BRIDGE_X
 }
 
 #pragma endregion
@@ -1906,6 +1029,12 @@ void* Bridges::_createBridge(HANDLE rmt_handle, void* target_func, int func_type
 	if (!reverse_bridge)
 		local_probe_func_size = Memory::Local::calcFuncSize(local_probe_func);
 
+	// Get handle to kernel32 TODO more error checking like this in other places
+	HMODULE kernel32_handle = GetModuleHandle("kernel32.dll");
+	if (kernel32_handle == NULL) {
+		return 0;
+	}
+
 	// BridgeData struct to be patched into the copied bridge function
 	BridgeData* local_bridge_data = new BridgeData{
 		new_local_handle,
@@ -1918,14 +1047,14 @@ void* Bridges::_createBridge(HANDLE rmt_handle, void* target_func, int func_type
 		arg_info,
 		reverse_bridge,
 
-		reinterpret_cast<VirtualAlloc_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "VirtualAlloc")),
-		reinterpret_cast<VirtualAllocEx_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "VirtualAllocEx")),
-		reinterpret_cast<VirtualFree_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "VirtualFree")),
-		reinterpret_cast<VirtualFreeEx_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "VirtualFreeEx")),
-		reinterpret_cast<ReadProcessMemory_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "ReadProcessMemory")),
-		reinterpret_cast<WriteProcessMemory_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "WriteProcessMemory")),
-		reinterpret_cast<CreateRemoteThread_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "CreateRemoteThread")),
-		reinterpret_cast<WaitForSingleObject_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "WaitForSingleObject"))
+		reinterpret_cast<VirtualAlloc_t>(GetProcAddress(kernel32_handle, "VirtualAlloc")),
+		reinterpret_cast<VirtualAllocEx_t>(GetProcAddress(kernel32_handle, "VirtualAllocEx")),
+		reinterpret_cast<VirtualFree_t>(GetProcAddress(kernel32_handle, "VirtualFree")),
+		reinterpret_cast<VirtualFreeEx_t>(GetProcAddress(kernel32_handle, "VirtualFreeEx")),
+		reinterpret_cast<ReadProcessMemory_t>(GetProcAddress(kernel32_handle, "ReadProcessMemory")),
+		reinterpret_cast<WriteProcessMemory_t>(GetProcAddress(kernel32_handle, "WriteProcessMemory")),
+		reinterpret_cast<CreateRemoteThread_t>(GetProcAddress(kernel32_handle, "CreateRemoteThread")),
+		reinterpret_cast<WaitForSingleObject_t>(GetProcAddress(kernel32_handle, "WaitForSingleObject"))
 	};
 
 	// Length of the bridge function and copy of the bridge function in either local or rmt process depending on if the bridge is reversed
