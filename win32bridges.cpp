@@ -87,127 +87,127 @@ typedef struct BridgeData {
 //   - Clean up stack frame, return
 
 // Set up stack frame
-#define BRK_PROBE_STACKFRAME_SETUP __asm { \
-	__asm push ebp                         \
-	__asm mov ebp, esp                     \
-    __asm push esi                         \
-    __asm push edi                         \
-	__asm push ebx                         \
+#define BRK_PROBE_STACKFRAME_SETUP __asm {	\
+	__asm push ebp							\
+	__asm mov ebp, esp						\
+	__asm push esi							\
+	__asm push edi							\
+	__asm push ebx							\
 }
 
 // Load argdata and arginfo.nslots from ProbeParameters
-#define BRK_PROBE_LOADPARAMS __asm {                   \
-	__asm mov ebx, [ebp + 8] /* probe_params */        \
-	__asm mov esi, [ebx]ProbeParameters.arg_info       \
-	__asm and esi, 0xff /* get nslots from arg_info */ \
-	__asm mov eax, [ebx]ProbeParameters.argdata        \
+#define BRK_PROBE_LOADPARAMS __asm {					\
+	__asm mov ebx, [ebp + 8] /* probe_params */			\
+	__asm mov esi, [ebx]ProbeParameters.arg_info		\
+	__asm and esi, 0xff /* get nslots from arg_info */	\
+	__asm mov eax, [ebx]ProbeParameters.argdata			\
 }
 
 // Prepare args for function call
-#define BRK_PROBE_PREPARGS __asm {   \
-	__asm argloop_start:             \
-	__asm dec esi                    \
-	__asm cmp esi, 0                 \
-	__asm jl short argloop_end       \
-	__asm push[eax + esi * TYPE int] \
-	__asm jmp short argloop_start    \
-	__asm argloop_end:               \
+#define BRK_PROBE_PREPARGS __asm {		\
+	__asm argloop_start:				\
+	__asm dec esi						\
+	__asm cmp esi, 0					\
+	__asm jl short argloop_end			\
+	__asm push[eax + esi * TYPE int]	\
+	__asm jmp short argloop_start		\
+	__asm argloop_end:					\
 }
 
 // Prepare args for function call
-#define BRK_PROBE_PREPARGS_FASTCALL __asm { \
-	__asm mov edi, [ebx]ProbeParameters.arg_info \
-	__asm shr edi, 16 \
-	__asm and edi, 0xff /* edi will be second slot index */ \
-\
-	__asm mov ebx, [ebx]ProbeParameters.arg_info \
-	__asm shr ebx, 8 \
-	__asm and ebx, 0xff /* ebx will be first slot index */ \
-\
-	__asm argloop_start: \
-	__asm dec esi \
-	__asm cmp esi, 0 \
-	__asm jl short argloop_end \
-\
-	__asm cmp esi, ebx /* test if current arg is marked as first arg that is 4 bytes or less */ \
-	__asm jne short test_second_reg_arg \
-	__asm mov ecx, [eax + esi * TYPE int] /* load first register arg */ \
-	__asm jmp short argloop_start \
-\
-	__asm test_second_reg_arg: /* test if current arg is marked as second arg that is 4 bytes or less */ \
-	__asm cmp esi, edi \
-	__asm jne short load_stack_arg \
-	__asm mov edx, [eax + esi * TYPE int] /* load second register arg */ \
-	__asm jmp short argloop_start \
- \
-	__asm load_stack_arg: \
-	__asm push[eax + esi * TYPE int] /* push arg onto stack */ \
-	__asm jmp short argloop_start \
-	__asm argloop_end: \
+#define BRK_PROBE_PREPARGS_FASTCALL __asm {																	\
+	__asm mov edi, [ebx]ProbeParameters.arg_info															\
+	__asm shr edi, 16																						\
+	__asm and edi, 0xff /* edi will be second slot index */													\
+																											\
+	__asm mov ebx, [ebx]ProbeParameters.arg_info															\
+	__asm shr ebx, 8																						\
+	__asm and ebx, 0xff /* ebx will be first slot index */													\
+																											\
+	__asm argloop_start:																					\
+	__asm dec esi																							\
+	__asm cmp esi, 0																						\
+	__asm jl short argloop_end																				\
+																											\
+	__asm cmp esi, ebx /* test if current arg is marked as first arg that is 4 bytes or less */				\
+	__asm jne short test_second_reg_arg																		\
+	__asm mov ecx, [eax + esi * TYPE int] /* load first register arg */										\
+	__asm jmp short argloop_start																			\
+																											\
+	__asm test_second_reg_arg: /* test if current arg is marked as second arg that is 4 bytes or less */	\
+	__asm cmp esi, edi																						\
+	__asm jne short load_stack_arg																			\
+	__asm mov edx, [eax + esi * TYPE int] /* load second register arg */									\
+	__asm jmp short argloop_start																			\
+																											\
+	__asm load_stack_arg:																					\
+	__asm push[eax + esi * TYPE int] /* push arg onto stack */												\
+	__asm jmp short argloop_start																			\
+	__asm argloop_end:																						\
 }
 
 // Call target function
-#define BRK_PROBE_CALLTARGET __asm {   \
-	__asm call [ebx]ProbeParameters.target_func \
+#define BRK_PROBE_CALLTARGET __asm {			\
+	__asm call [ebx]ProbeParameters.target_func	\
 }
 
 // Call target function
-#define BRK_PROBE_CALLTARGET_FASTCALL __asm {   \
-	__asm mov ebx, [ebp + 8] /* probe_params */ \
-	__asm call [ebx]ProbeParameters.target_func \
+#define BRK_PROBE_CALLTARGET_FASTCALL __asm {	\
+	__asm mov ebx, [ebp + 8] /* probe_params */	\
+	__asm call [ebx]ProbeParameters.target_func	\
 }
 
 // Remove args from stack
-#define BRK_PROBE_REMOVEARGS __asm {                   \
-	__asm mov ecx, [ebx]ProbeParameters.arg_info       \
-	__asm and ecx, 0xff /* get nslots from arg_info */ \
-	__asm lea esp, [esp + ecx * TYPE int]              \
+#define BRK_PROBE_REMOVEARGS __asm {					\
+	__asm mov ecx, [ebx]ProbeParameters.arg_info		\
+	__asm and ecx, 0xff /* get nslots from arg_info */	\
+	__asm lea esp, [esp + ecx * TYPE int]				\
 }
 
 // Retrieve return value (int)
-#define BRK_PROBE_GETRTNVAL_INT __asm {             \
-	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr \
-	__asm cmp ecx, 0                                \
-	__asm je short noret                            \
-	__asm mov[ecx], eax                             \
-	__asm noret:                                    \
+#define BRK_PROBE_GETRTNVAL_INT __asm {				\
+	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr	\
+	__asm cmp ecx, 0								\
+	__asm je short noret							\
+	__asm mov[ecx], eax								\
+	__asm noret:									\
 }
 
 // Retrieve return value (int64)
-#define BRK_PROBE_GETRTNVAL_INT64 __asm {           \
-	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr \
-	__asm cmp ecx, 0                                \
-	__asm je short noret                            \
-	__asm mov[ecx], eax                             \
-	__asm mov[ecx + 4], edx                         \
-	__asm noret:                                    \
+#define BRK_PROBE_GETRTNVAL_INT64 __asm {			\
+	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr	\
+	__asm cmp ecx, 0								\
+	__asm je short noret							\
+	__asm mov[ecx], eax								\
+	__asm mov[ecx + 4], edx							\
+	__asm noret:									\
 }
 
 // Retrieve return value (float)
-#define BRK_PROBE_GETRTNVAL_FLOAT __asm {           \
-	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr \
-	__asm cmp ecx, 0                                \
-	__asm je short noret                            \
-	__asm fstp dword ptr[ecx]                       \
-	__asm noret:                                    \
+#define BRK_PROBE_GETRTNVAL_FLOAT __asm {			\
+	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr	\
+	__asm cmp ecx, 0								\
+	__asm je short noret							\
+	__asm fstp dword ptr[ecx]						\
+	__asm noret:									\
 }
 
 // Retrieve return value (double)
-#define BRK_PROBE_GETRTNVAL_DOUBLE __asm {          \
-	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr \
-	__asm cmp ecx, 0                                \
-	__asm je short noret                            \
-	__asm fstp qword ptr[ecx]                       \
-	__asm noret:                                    \
+#define BRK_PROBE_GETRTNVAL_DOUBLE __asm {			\
+	__asm mov ecx, [ebx]ProbeParameters.rtnval_addr	\
+	__asm cmp ecx, 0								\
+	__asm je short noret							\
+	__asm fstp qword ptr[ecx]						\
+	__asm noret:									\
 }
 
 // Clean up stack frame and return
-#define BRK_PROBE_STACKFRAME_CLEANUP __asm { \
-	__asm pop ebx                            \
-	__asm pop edi                            \
-	__asm pop esi                            \
-	__asm pop ebp                            \
-	__asm ret 4                              \
+#define BRK_PROBE_STACKFRAME_CLEANUP __asm {	\
+	__asm pop ebx								\
+	__asm pop edi								\
+	__asm pop esi								\
+	__asm pop ebp								\
+	__asm ret 4									\
 }
 
 #pragma endregion
@@ -356,159 +356,159 @@ __declspec(naked) DWORD WINAPI probeFastcallRtnDbl_ptbl(LPVOID) {
 #pragma region Bridge Bricks
 
 // Set up stack and preserve registers
-#define BRK_BRIDGE_A __asm {    \
-	__asm push ebp              \
-	__asm mov ebp, esp          \
-	__asm sub esp, __LOCAL_SIZE \
-	__asm push ebx              \
-	__asm push esi              \
-	__asm push edi              \
+#define BRK_BRIDGE_A __asm {	\
+	__asm push ebp				\
+	__asm mov ebp, esp			\
+	__asm sub esp, __LOCAL_SIZE	\
+	__asm push ebx				\
+	__asm push esi				\
+	__asm push edi				\
 }
 
-#define BRK_BRIDGE_B_FASTCALL __asm {              \
-	__asm push edx /* store to be handled later */ \
-	__asm push ecx /* store to be handled later */ \
+#define BRK_BRIDGE_B_FASTCALL __asm {				\
+	__asm push edx /* store to be handled later */	\
+	__asm push ecx /* store to be handled later */	\
 }
 
 // Declare variables all at once because this is for naked function
-#define BRK_BRIDGE_C                     \
-	BridgeData* bridge_data;             \
-	ProbeParameters* local_probe_params; \
-	int argdata_size;                    \
-	void** local_probe_argdata;          \
-	void* rmt_allocated_chonk;           \
-	void* rmt_probe_params;              \
-	void* rmt_probe_func;                \
+#define BRK_BRIDGE_C						\
+	BridgeData* bridge_data;				\
+	ProbeParameters* local_probe_params;	\
+	int argdata_size;						\
+	void** local_probe_argdata;				\
+	void* rmt_allocated_chonk;				\
+	void* rmt_probe_params;					\
+	void* rmt_probe_func;					\
 	HANDLE rmt_thread_handle;
 
-#define BRK_BRIDGE_D_FASTCALL     \
-	int arg_first_idx;            \
-	int arg_second_idx;           \
+#define BRK_BRIDGE_D_FASTCALL	\
+	int arg_first_idx;			\
+	int arg_second_idx;			\
 	int arg_reg_count;
 
 #define BRK_BRIDGE_E_INTFLT   int rtn_value;
 #define BRK_BRIDGE_E_INT64DBL __int64 rtn_value;
 
-#define BRK_BRIDGE_F                                                                                                                                            \
-	/* Address of BridgeData struct to be patched in when function is copied, done in asm to avoid problematic compiler optimization */                         \
-	__asm { mov bridge_data, 0xBAADB00F }                                                                                                                       \
-	                                                                                                                                                            \
-	/* Allocate local ProbeParameters struct and write the target function address into the struct */                                                           \
-	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)); \
+#define BRK_BRIDGE_F																																			\
+	/* Address of BridgeData struct to be patched in when function is copied, done in asm to avoid problematic compiler optimization */							\
+	__asm { mov bridge_data, 0xBAADB00F }																														\
+																																								\
+	/* Allocate local ProbeParameters struct and write the target function address into the struct */															\
+	local_probe_params = reinterpret_cast<ProbeParameters*>(bridge_data->fnVirtualAlloc(0, sizeof(ProbeParameters), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));	\
 	local_probe_params->target_func = bridge_data->target_func;
 
 // Copy the arg info to the probe parameters, and adjust the nslots if a handle is to be passed
-#define BRK_BRIDGE_G_CDECLSTDCALL                                 \
-	local_probe_params->arg_info = bridge_data->arg_info;         \
-	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)      \
+#define BRK_BRIDGE_G_CDECLSTDCALL									\
+	local_probe_params->arg_info = bridge_data->arg_info;			\
+	if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)		\
 		local_probe_params->arg_info += bridge_data->pass_handle;
 //
-#define BRK_BRIDGE_G_FASTCALL                                                            \
-	local_probe_params->arg_info = bridge_data->arg_info;                                \
-	if (bridge_data->pass_handle) {                                                      \
-		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)                         \
-			local_probe_params->arg_info += 1; /* nslots + 1 */                          \
-	                                                                                     \
-		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {                        \
-			/* set idx2 to current idx1, then set idx1 to 0x00 */                        \
-			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) | \
-				((local_probe_params->arg_info << 8) & 0x00ff0000);                      \
-		}                                                                                \
+#define BRK_BRIDGE_G_FASTCALL																\
+	local_probe_params->arg_info = bridge_data->arg_info;									\
+	if (bridge_data->pass_handle) {															\
+		if (ARGINFO_NSLOTS(local_probe_params->arg_info) < 0xff)							\
+			local_probe_params->arg_info += 1; /* nslots + 1 */								\
+																							\
+		if (ARGINFO_IDX1(local_probe_params->arg_info) != 0x00) {							\
+			/* set idx2 to current idx1, then set idx1 to 0x00 */							\
+			local_probe_params->arg_info = (local_probe_params->arg_info & 0xff0000ff) |	\
+				((local_probe_params->arg_info << 8) & 0x00ff0000);							\
+		}																					\
 	}
 
-#define BRK_BRIDGE_H                                                                                                                                            \
-	/* Calculate size of memory chunk needed to store args */                                                                                                   \
-	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);                                                                                \
-	                                                                                                                                                            \
-	/* Allocate space locally for argument data */                                                                                                              \
-	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));                     \
-	/* If local handle is to be passed to target function, then add it to args... also adjust the start addr of the arg data chunk to simplify the asm ahead */ \
-	if (bridge_data->pass_handle) {                                                                                                                             \
-		local_probe_argdata[0] = bridge_data->local_handle;                                                                                                     \
-		local_probe_argdata += 1;  /* hacky but efficient k don't @ me */                                                                                       \
+#define BRK_BRIDGE_H																																			\
+	/* Calculate size of memory chunk needed to store args */																									\
+	argdata_size = ARGINFO_NSLOTS(local_probe_params->arg_info) * sizeof(void*);																				\
+																																								\
+	/* Allocate space locally for argument data */																												\
+	local_probe_argdata = reinterpret_cast<void**>(bridge_data->fnVirtualAlloc(0, argdata_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));						\
+	/* If local handle is to be passed to target function, then add it to args... also adjust the start addr of the arg data chunk to simplify the asm ahead */	\
+	if (bridge_data->pass_handle) {																																\
+		local_probe_argdata[0] = bridge_data->local_handle;																										\
+		local_probe_argdata += 1;  /* hacky but efficient k don't @ me */																						\
 	}
 
 
 // Read args from stack into allocated argument data chunk
-#define BRK_BRIDGE_I_CDECLSTDCALL                                     \
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) { \
-		__asm {                                                       \
-			__asm mov ecx, [i]                                        \
-			__asm shl ecx, 2                                          \
-			__asm mov eax, [ebp + 8 + ecx]                            \
-			__asm mov edx, [local_probe_argdata]                      \
-			__asm mov[edx + ecx], eax                                 \
-		}                                                             \
+#define BRK_BRIDGE_I_CDECLSTDCALL										\
+	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {	\
+		__asm {															\
+			__asm mov ecx, [i]											\
+			__asm shl ecx, 2											\
+			__asm mov eax, [ebp + 8 + ecx]								\
+			__asm mov edx, [local_probe_argdata]						\
+			__asm mov[edx + ecx], eax									\
+		}																\
 	}
 //
-#define BRK_BRIDGE_I_FASTCALL                                                                                          \
-	arg_first_idx = ARGINFO_IDX1(bridge_data->arg_info); /* slot index of arg passed through ecx */                    \
-	arg_second_idx = ARGINFO_IDX2(bridge_data->arg_info); /* slot index of arg passed through edx */                   \
-	arg_reg_count = 0; /* to be set to number of arguments passed in registers */                                      \
-	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {                                                  \
-		__asm {                                                                                                        \
-			__asm mov ecx, [i]                                                                                         \
-	                                                                                                                   \
-			/* test if this is the arg that was passed through ecx, if so then retrieve, and write to argdata chunk */ \
-			__asm mov eax, [arg_first_idx]                                                                             \
-			__asm cmp eax, ecx                                                                                         \
-			__asm jne short arg_test_second                                                                            \
-			__asm mov edx, [local_probe_argdata]                                                                       \
-			__asm mov eax, [esp] /* stored value of ecx */                                                             \
-			__asm mov [edx + ecx * TYPE int], eax                                                                      \
-			__asm inc [arg_reg_count]                                                                                  \
-			__asm jmp short cont                                                                                       \
-	                                                                                                                   \
-			/* test if this is the arg that was passed through edx, if so then retrieve, and write to argdata chunk */ \
-			__asm arg_test_second:                                                                                     \
-			__asm mov eax, [arg_second_idx]                                                                            \
-			__asm cmp eax, ecx                                                                                         \
-			__asm jne short arg_stk_copy                                                                               \
-			__asm mov edx, [local_probe_argdata]                                                                       \
-			__asm mov eax, [esp + 4] /* stored value of edx */                                                         \
-			__asm mov [edx + ecx * TYPE int], eax                                                                      \
-			__asm inc [arg_reg_count]                                                                                  \
-			__asm jmp short cont                                                                                       \
-	                                                                                                                   \
-			/* retrieve arg that was passed to this function via the stack and write to argdata chunk */               \
-			__asm arg_stk_copy:                                                                                        \
-			__asm mov edx, [local_probe_argdata]                                                                       \
-			__asm sub ecx, [arg_reg_count]                                                                             \
-			__asm shl ecx, 2                                                                                           \
-			__asm mov eax, [ebp + 8 + ecx] /* value of the arg passed on the stack */                                  \
-			__asm shr ecx, 2                                                                                           \
-			__asm add ecx, [arg_reg_count]                                                                             \
-			__asm shl ecx, 2                                                                                           \
-			__asm mov [edx + ecx], eax                                                                                 \
-	                                                                                                                   \
-			__asm cont: /* continue with loop */                                                                       \
-		}                                                                                                              \
+#define BRK_BRIDGE_I_FASTCALL																							\
+	arg_first_idx = ARGINFO_IDX1(bridge_data->arg_info); /* slot index of arg passed through ecx */						\
+	arg_second_idx = ARGINFO_IDX2(bridge_data->arg_info); /* slot index of arg passed through edx */					\
+	arg_reg_count = 0; /* to be set to number of arguments passed in registers */										\
+	for (int i = 0; i < ARGINFO_NSLOTS(bridge_data->arg_info); i++) {													\
+		__asm {																											\
+			__asm mov ecx, [i]																							\
+																														\
+			/* test if this is the arg that was passed through ecx, if so then retrieve, and write to argdata chunk */	\
+			__asm mov eax, [arg_first_idx]																				\
+			__asm cmp eax, ecx																							\
+			__asm jne short arg_test_second																				\
+			__asm mov edx, [local_probe_argdata]																		\
+			__asm mov eax, [esp] /* stored value of ecx */																\
+			__asm mov [edx + ecx * TYPE int], eax																		\
+			__asm inc [arg_reg_count]																					\
+			__asm jmp short cont																						\
+																														\
+			/* test if this is the arg that was passed through edx, if so then retrieve, and write to argdata chunk */	\
+			__asm arg_test_second:																						\
+			__asm mov eax, [arg_second_idx]																				\
+			__asm cmp eax, ecx																							\
+			__asm jne short arg_stk_copy																				\
+			__asm mov edx, [local_probe_argdata]																		\
+			__asm mov eax, [esp + 4] /* stored value of edx */															\
+			__asm mov [edx + ecx * TYPE int], eax																		\
+			__asm inc [arg_reg_count]																					\
+			__asm jmp short cont																						\
+																														\
+			/* retrieve arg that was passed to this function via the stack and write to argdata chunk */				\
+			__asm arg_stk_copy:																							\
+			__asm mov edx, [local_probe_argdata]																		\
+			__asm sub ecx, [arg_reg_count]																				\
+			__asm shl ecx, 2																							\
+			__asm mov eax, [ebp + 8 + ecx] /* value of the arg passed on the stack */									\
+			__asm shr ecx, 2																							\
+			__asm add ecx, [arg_reg_count]																				\
+			__asm shl ecx, 2																							\
+			__asm mov [edx + ecx], eax																					\
+																														\
+			__asm cont: /* continue with loop */																		\
+		}																												\
 	}
 
 // If local handle is to be passed, re-adjust the start addr of the arg data chunk to how it should be
-#define BRK_BRIDGE_J              \
-	if (bridge_data->pass_handle) \
+#define BRK_BRIDGE_J				\
+	if (bridge_data->pass_handle)	\
 		local_probe_argdata -= 1;
 
 // Allocate space for argdata, return value, probe params, and probe func inside remote process all in one call and easy to clean up data chonk
-#define BRK_BRIDGE_K_INTFLT                                                                                 \
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0, \
-		argdata_size + 4 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,                    \
+#define BRK_BRIDGE_K_INTFLT																					\
+	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,	\
+		argdata_size + 4 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,					\
 		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
 //
-#define BRK_BRIDGE_K_INT64DBL                                                                               \
-	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0, \
-		argdata_size + 8 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,                    \
+#define BRK_BRIDGE_K_INT64DBL																				\
+	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,	\
+		argdata_size + 8 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,					\
 		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
 
-#define BRK_BRIDGE_L                                                                                                           \
-	/* Set up the probe params struct to know the address of the allocated space for argdata, */                                   \
-	/* and copy the local argument data to that remote space */                                                                    \
-	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);                                                   \
-	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0); \
-	                                                                                                                               \
-	/* Set up the probe params struct to know the address of the allocated space for the return value, */                          \
-	/* and store so that the retval can be read once the rmt function returns */                                                   \
+#define BRK_BRIDGE_L																												\
+	/* Set up the probe params struct to know the address of the allocated space for argdata, */									\
+	/* and copy the local argument data to that remote space */																		\
+	local_probe_params->argdata = reinterpret_cast<void**>(rmt_allocated_chonk);													\
+	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, local_probe_params->argdata, local_probe_argdata, argdata_size, 0);	\
+																																	\
+	/* Set up the probe params struct to know the address of the allocated space for the return value, */							\
+	/* and store so that the retval can be read once the rmt function returns */													\
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
 // Store the address of the allocated space for the rmt probe params
@@ -523,25 +523,25 @@ __declspec(naked) DWORD WINAPI probeFastcallRtnDbl_ptbl(LPVOID) {
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
 // If the probe func size is set to zero, that means that the probe func already exists in the rmt process and doesn't need to be copied. Otherwise, copy it over.
-#define BRK_BRIDGE_O_INTFLT                                                                                                                         \
-	if (bridge_data->local_probe_func_size) {                                                                                                       \
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4 + sizeof(ProbeParameters));     \
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0); \
-	} else {                                                                                                                                        \
-		rmt_probe_func = bridge_data->probe_func;                                                                                                   \
+#define BRK_BRIDGE_O_INTFLT																															\
+	if (bridge_data->local_probe_func_size) {																										\
+		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4 + sizeof(ProbeParameters));		\
+		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);	\
+	} else {																																		\
+		rmt_probe_func = bridge_data->probe_func;																									\
 	}
-#define BRK_BRIDGE_O_INT64DBL                                                                                                                       \
-	if (bridge_data->local_probe_func_size) {                                                                                                       \
-		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8 + sizeof(ProbeParameters));     \
-		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0); \
-	} else {                                                                                                                                        \
-		rmt_probe_func = bridge_data->probe_func;                                                                                                   \
+#define BRK_BRIDGE_O_INT64DBL																														\
+	if (bridge_data->local_probe_func_size) {																										\
+		rmt_probe_func = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8 + sizeof(ProbeParameters));		\
+		bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_func, bridge_data->probe_func, bridge_data->local_probe_func_size, 0);	\
+	} else {																																		\
+		rmt_probe_func = bridge_data->probe_func;																									\
 	}
 
 // Create new remote thread starting on the remote probe function, pass the address of the remote ProbeParameters struct to the remote probe function
-#define BRK_BRIDGE_P                                                                                                              \
-	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0); \
-	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);                                                              \
+#define BRK_BRIDGE_P																												\
+	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);	\
+	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);																\
 	rtn_value = 0;
 
 // Retrieve return value from remote process
@@ -552,53 +552,53 @@ __declspec(naked) DWORD WINAPI probeFastcallRtnDbl_ptbl(LPVOID) {
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
 
 // Free all left over allocated space
-#define BRK_BRIDGE_R                                                                            \
-	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE); \
-	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);                             \
+#define BRK_BRIDGE_R																			\
+	bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);	\
+	bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);								\
 	bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
 
 // Properly pass the return value
 #define BRK_BRIDGE_S_INT __asm mov eax, [rtn_value]
-#define BRK_BRIDGE_S_INT64 __asm { \
-	__asm lea ecx, [rtn_value]     \
-	__asm mov eax, [ecx]           \
-	__asm mov edx, [ecx + 4]       \
+#define BRK_BRIDGE_S_INT64 __asm {	\
+	__asm lea ecx, [rtn_value]		\
+	__asm mov eax, [ecx]			\
+	__asm mov edx, [ecx + 4]		\
 }
 #define BRK_BRIDGE_S_FLT __asm fld dword ptr[rtn_value]
 #define BRK_BRIDGE_S_DBL __asm fld qword ptr[rtn_value]
 
 // Clean up stack
-#define BRK_BRIDGE_T_STDCALLFASTCALL __asm {                                  \
-	__asm mov ecx, [bridge_data]                                              \
-	__asm mov ecx, [ecx]BridgeData.arg_info                                   \
-	__asm and ecx, 0xff /* get nslots from arg info for later arg clearing */ \
+#define BRK_BRIDGE_T_STDCALLFASTCALL __asm {									\
+	__asm mov ecx, [bridge_data]												\
+	__asm mov ecx, [ecx]BridgeData.arg_info										\
+	__asm and ecx, 0xff /* get nslots from arg info for later arg clearing */	\
 }
 //
-#define BRK_BRIDGE_U_FASTCALL __asm {                                                                \
-	__asm sub ecx, [arg_reg_count] /* adjust to be number of slots that are actually on the stack */ \
-                                                                                                     \
-	__asm add esp, 8 /* because I pushed ecx and edx to save their values */                         \
+#define BRK_BRIDGE_U_FASTCALL __asm {																	\
+	__asm sub ecx, [arg_reg_count] /* adjust to be number of slots that are actually on the stack */	\
+																										\
+	__asm add esp, 8 /* because I pushed ecx and edx to save their values */							\
 }
 
 // Restore registers
-#define BRK_BRIDGE_V __asm { \
-	__asm pop edi            \
-	__asm pop esi            \
-	__asm pop ebx            \
-	__asm mov esp, ebp       \
-	__asm pop ebp            \
+#define BRK_BRIDGE_V __asm {	\
+	__asm pop edi				\
+	__asm pop esi				\
+	__asm pop ebx				\
+	__asm mov esp, ebp			\
+	__asm pop ebp				\
 }
 
 // very hacky way to clear args off of stack while keeping the return address on top
 // has to be hacky like this since I want to actually use ret and not fake it with a jmp
-#define BRK_BRIDGE_W_STDCALLFASTCALL __asm { \
-	__asm argloop_start:                     \
-	__asm dec ecx                            \
-	__asm cmp ecx, 0                         \
-	__asm jl short argloop_end               \
-	__asm pop dword ptr [esp]                \
-	__asm jmp short argloop_start            \
-	__asm argloop_end:                       \
+#define BRK_BRIDGE_W_STDCALLFASTCALL __asm {	\
+	__asm argloop_start:						\
+	__asm dec ecx								\
+	__asm cmp ecx, 0							\
+	__asm jl short argloop_end					\
+	__asm pop dword ptr [esp]					\
+	__asm jmp short argloop_start				\
+	__asm argloop_end:							\
 }
 
 #define BRK_BRIDGE_X __asm ret
