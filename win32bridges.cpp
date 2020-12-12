@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdio.h>
 
 #include "win32bridges.hpp"
 #include "win32memory.hpp"
@@ -21,13 +22,23 @@ typedef BOOL(WINAPI* ReadProcessMemory_t)(HANDLE, LPCVOID, LPVOID, SIZE_T, SIZE_
 typedef BOOL(WINAPI* WriteProcessMemory_t)(HANDLE, LPVOID, LPCVOID, SIZE_T, SIZE_T);
 typedef HANDLE(WINAPI* CreateRemoteThread_t)(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T, void*, LPVOID, DWORD, LPDWORD);
 typedef DWORD(WINAPI* WaitForSingleObject_t)(HANDLE, DWORD);
+typedef BOOL (WINAPI* GetExitCodeThread_t)(HANDLE, LPDWORD);
+//
+typedef LPTOP_LEVEL_EXCEPTION_FILTER(WINAPI* SetUnhandledExceptionFilter_t)(LPTOP_LEVEL_EXCEPTION_FILTER);
+typedef PVOID(WINAPI* AddVectoredContinueHandler_t)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+typedef ULONG(WINAPI* RemoveVectoredContinueHandler_t)(PVOID);
+typedef VOID(WINAPI* RaiseException_t)(DWORD, DWORD, DWORD, ULONG_PTR*);
 
 // Struct used by probe functions to call target functions.
 typedef struct ProbeParameters {
 	void* target_func;
 	int arg_info;
-	void** argdata; // TODO: rename to arg_data // TODO: I mean... make this an int pointer? 
+	void** argdata; // TODO: rename to arg_data // TODO: I mean... make this an int pointer?
 	void* rtnval_addr;
+
+	SetUnhandledExceptionFilter_t fnSetUnhandledExceptionFilter;
+	AddVectoredContinueHandler_t fnAddVectoredContinueHandler;
+	RemoveVectoredContinueHandler_t fnRemoveVectoredContinueHandler;
 } ProbeParameters;
 
 // Struct that gets used by bridge functions so that they have context of how to read args and how to call the target function.
@@ -50,6 +61,11 @@ typedef struct BridgeData {
 	WriteProcessMemory_t fnWriteProcessMemory;
 	CreateRemoteThread_t fnCreateRemoteThread;
 	WaitForSingleObject_t fnWaitForSingleObject;
+	GetExitCodeThread_t fnGetExitCodeThread;
+	SetUnhandledExceptionFilter_t fnSetUnhandledExceptionFilter;
+	AddVectoredContinueHandler_t fnAddVectoredContinueHandler;
+	RemoveVectoredContinueHandler_t fnRemoveVectoredContinueHandler;
+	RaiseException_t fnRaiseException;
 } BridgeData;
 
 // If you are curious about how arg_info is encoded...
@@ -89,8 +105,18 @@ __declspec(naked) DWORD WINAPI probeCdecl_ptbl(LPVOID) {
 		mov ebp, esp
 		push ebx
 
-		// Load important data from the ProbeParameters struct arg into various registers
+		// Load ProbeParameters struct arg into working register
 		mov ebx, [ebp + 8] // probe_params
+
+		// Setup unhandled EH
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3 // size of pop eax, jmp short
+		push eax
+		call[ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
+		// Load important data from the ProbeParameters struct arg into various registers
 		mov ecx, [ebx]ProbeParameters.arg_info
 		and ecx, 0xff // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
@@ -119,6 +145,42 @@ __declspec(naked) DWORD WINAPI probeCdecl_ptbl(LPVOID) {
 		je short noret
 		mov [ecx], eax
 		noret:
+
+		// Set probe return value to zero, goto cleanup
+		xor eax, eax
+		jmp short handlerloop_end
+
+		// Used during handler setup to get the address of the handler
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		// unhandled EH -> Check if exception code is c++ exception. If yes then set probe return value to 1, then clear stack until sentinel value is hit. If no then continue search (crash).
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363 // Check for c++ exception code
+		je short handler_start
+		mov eax, 0  // EXCEPTION_CONTINUE_SEARCH
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		// Remove unhandled EH
+		lea ebp, [esp + 8]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
 
 		// Restore registers, clean up stack, and return
 		pop ebx
@@ -671,6 +733,7 @@ __declspec(naked) void* __cdecl bridgeCdecl_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	int rtn_value;
 
 	// Address of BridgeData struct to be patched in when function is copied
@@ -710,6 +773,8 @@ __declspec(naked) void* __cdecl bridgeCdecl_ptbl() {
 	if (bridge_data->pass_handle)
 		local_probe_argdata -= 1;
 
+	// TODO: try SEC_IMAGE... literally just PAGE_EXECUTE_READWRITE | SEC_IMAGE... might need to use NtCreateSection with SEC_IMAGE tho idk
+	// Might actually be MEM_EXECUTE_OPTION_EXECUTE_DISPATCH_ENABLE
 	// Allocate space for argdata, return value, probe params, and probe func inside remote process all in one call and easy to clean up data chonk
 	rmt_allocated_chonk = reinterpret_cast<void*>(bridge_data->fnVirtualAllocEx(bridge_data->rmt_handle, 0,
 		argdata_size + 4 + sizeof(ProbeParameters) + bridge_data->local_probe_func_size,
@@ -721,6 +786,11 @@ __declspec(naked) void* __cdecl bridgeCdecl_ptbl() {
 
 	// Set up the probe params struct to know the address of the allocated space for the return value, and store so that the retval can be read once the rmt function returns
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
+
+	// Add the addresses of necessary winapi funcs to the probe params struct
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+	local_probe_params->fnAddVectoredContinueHandler = bridge_data->fnAddVectoredContinueHandler;
+	local_probe_params->fnRemoveVectoredContinueHandler = bridge_data->fnRemoveVectoredContinueHandler;
 
 	// Store the address of the allocated space for the rmt probe params and then copy the local struct to rmt
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
@@ -737,6 +807,45 @@ __declspec(naked) void* __cdecl bridgeCdecl_ptbl() {
 	// Create new remote thread starting on the remote probe function, pass the address of the remote ProbeParameters struct to the remote probe function
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	// Check for error
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0 // Pointer to RTTI descriptor for type
+			push 1 // 1 = simple type // start of _CatchableType
+
+			mov ebx, esp
+			push 1   // number of types in array
+			push ebx // Pointer to first _CatchableType in array // start of _CatchableTypeArray
+
+			lea eax, [ebx - 8]
+			push eax // Pointer to _CatchableTypeArray
+			push 0
+			push 0
+			push 0   // start of _ThrowInfo
+
+			push 666 // thrown object
+
+			lea eax, [ebx - 24]
+			push eax          // Pointer to _ThrowInfo
+			lea eax, [ebx - 28]
+			push eax            // Pointer to thrown object
+			push 0x19930520 // start of exception argument array for RaiseException
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	// Retrieve return value from remote process
 	rtn_value = 0;
@@ -2209,7 +2318,12 @@ void* Bridges::_createBridge(HANDLE rmt_handle, void* target_func, int func_type
 		reinterpret_cast<ReadProcessMemory_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "ReadProcessMemory")),
 		reinterpret_cast<WriteProcessMemory_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "WriteProcessMemory")),
 		reinterpret_cast<CreateRemoteThread_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "CreateRemoteThread")),
-		reinterpret_cast<WaitForSingleObject_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "WaitForSingleObject"))
+		reinterpret_cast<WaitForSingleObject_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "WaitForSingleObject")),
+		reinterpret_cast<GetExitCodeThread_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "GetExitCodeThread")),
+		reinterpret_cast<SetUnhandledExceptionFilter_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "SetUnhandledExceptionFilter")),
+		reinterpret_cast<AddVectoredContinueHandler_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "AddVectoredContinueHandler")),
+		reinterpret_cast<RemoveVectoredContinueHandler_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "RemoveVectoredContinueHandler")),
+		reinterpret_cast<RaiseException_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "RaiseException"))
 	};
 
 	// Length of the bridge function and copy of the bridge function in either local or rmt process depending on if the bridge is reversed

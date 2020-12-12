@@ -81,11 +81,9 @@ void* Memory::Local::scan(byte* scan_addr, byte* end_addr, char* data, char* mas
 
 // Finds the end of a function.
 // Works by scanning for prolog of next function.
-// (it's the fastest way without needing a length disassembler or possibly more complex disassembly tools...
-// it isn't perfect but it gets the job done, even if it might copy an entire extra function sometimes
-// if the next function doesn't start with the right prolog)
+// (it's the fastest way without needing a length disassembler or possibly more complex disassembly tools)
 void* Memory::Local::findFuncEnd(void* func) {
-	byte* end = reinterpret_cast<byte*>(func) + 1;
+	byte* end = (byte*)func + 1;
 	while (end[0] != 0x55 || end[1] != 0x8B || end[2] != 0xEC)
 		end++;
 	return end;
@@ -93,7 +91,6 @@ void* Memory::Local::findFuncEnd(void* func) {
 
 // Duplicate a function.
 // Copies a function into newly allocated space.
-// Does not patch jmps/calls.
 // Returns pointer to copy of function.
 void* Memory::Local::duplicateFunc(void* func) {
 	size_t func_size = calcFuncSize(func) + 3;

@@ -38,6 +38,8 @@ enum Func_t {
 
 namespace Bridges {
 	// TODO: _typeInfo could use a little touch up for efficiency but fold expressions make me sad when I debug and I have been busyy... I will get around to it....
+	// I found this snippet on github that I think tbh could help replace the whole typeinfo cancer:
+	//		std::uint64_t arr_args[sizeof...(args) > 4 ? sizeof...(args) : 4] = { (std::uint64_t)(args)... };
 
 	// Internal function used by the macro BRIDGE_ARGS() to encode information about the given arguments into a 32-bit integer value.
 	template <typename... Args>
