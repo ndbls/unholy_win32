@@ -1,12 +1,12 @@
 # ⛧ Unholy Win32  ⛧
 
-Unholy is a C++17 library enabling some powerful hacks within x86 Windows systems.
+Unholy is a C++17 library that provides you with some fun hax on x86 Windows systems.
 
-It is essentially a standard memory hacking library, except it features a unique set of tools which allow for seamless function calls with wrapped return values across process boundaries, nicknamed *bridges*.
+It is essentially a standard and minimal memory debugging library, except it features a unique set of tools which allow for seamless function calls with wrapped return values across process boundaries, nicknamed *bridges*.
 
 It can be difficult to understand the purpose and power of this library from just explanations without an example, so here's a very easy to digest, simplified use case of this unholy library:
 
->You have program `banking_application.exe` and program `hacker.exe`. The latter program contains the unholy library, and it uses unholy bridges to call the function `int transferMoney(int accountId, int amount)` which is internal to `banking_application.exe`.
+>You have program `wallet_application.exe` and program `hacker.exe`. The latter program contains the unholy library, and it uses unholy bridges to call the function `int transferMoney(int recipientId, int amount)` which is internal to `wallet_application.exe`.
 
 Of course that is a dramatic example, but this library is flexible and the applications could be anything, such as `game.exe` and `cheat.exe` calling `void setHealth(int value)` completely externally. Bridges can also be in reverse, functioning like a callback from a remote process to a local function:
 
@@ -14,7 +14,7 @@ Of course that is a dramatic example, but this library is flexible and the appli
 
 No traditional methods of code injection are required in these examples, all of this can be done without having to leave your local program. No need to create a DLL or use an injector.
 
-Unholy Win32 also has everything one would expect from a regular memory hacking library,
+Unholy Win32 also has everything one would expect from a regular memory debugging library,
   - Hooking of local and remote functions
   - Scanning of local and remote process memory space
   - Utilities for easy manipulation of remote process memory
@@ -29,7 +29,7 @@ What exactly are bridges?
 
   - **Bridges can also be created in remote processes as a bridge to a local function**, allowing for callback functions in remote processes which when called by that process, can call local functions without the remote process having the knowledge that it is interacting with a bridge. These can be referred to as *reverse bridges*.
 
-This is extremely useful for programs that would otherwise inject code into another process in order to modify its behavior or to hook functions to aid in reverse engineering (since unholy memory tools contains hooking functions).
+This is extremely useful for programs that would otherwise inject code into another process in order to modify its behavior or to hook functions to aid in reverse engineering (since unholy memory tools contain hooking functions).
 
 ## How do I use this?
 Just import the files into your C++ project.
@@ -41,7 +41,7 @@ If you just want memory scanning/hooking, only copy `win32memory.hpp` and `win32
 This library can only be compiled with x86 MSVC due to the nature of how targeted it is, specifically bridges.
 It might compile with other tools if given a little bit of work, but it has not been tested.
 
-You should check out the [example projects](https://github.com/abls/unholy_examples) to better understand how to use bridges and the memory tools. The examples are very organized and straightforward, with comments, so it shouldn't be too difficult to understand. All of the functions are well documented with comments as well.
+You should check out the [example projects](https://github.com/abls/unholy_examples) to better understand how to use bridges and the memory tools. The examples are very organized and straightforward, with comments, so it shouldn't be too difficult to understand. All of the functions are well documented with comments as well. Also check out the [simple example](#simple-bridge-example) below in this file.
 
 ## FAQs
 > So like... What does it do?
@@ -63,7 +63,7 @@ This example is broken up into two programs, since the function of bridges is to
 
 This first program is the target program whose run-time behavior will be getting modified by our unholy program.
 ```c++
-// main.c - target.exe (the program getting dynamically modified)
+// main.cpp - target.exe (the program getting dynamically modified)
 #include <stdio.h>
 #include <Windows.h>
 
@@ -82,7 +82,7 @@ int main() {
 
 This is the unholy program that will be modifying the behavior of the target program while it is running.
 ```c++
-// main.c - hacker.exe (program that modifies the target program's behaviour)
+// main.cpp - hacker.exe (program that modifies the target program's behaviour)
 #include <stdio.h>
 #include <Windows.h>
 #include "unholy/win32memory.hpp"
